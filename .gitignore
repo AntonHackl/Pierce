@@ -1,0 +1,35 @@
+# Local cluster launchers and logs
+.slurm/
+
+# Build products
+build/
+**/build/
+**/build_*/
+*.ptx
+
+# Benchmark data and generated results
+data/
+microns_data/
+benchmarks/data/
+benchmarks/slurm_logs/
+benchmarks/**/data/
+benchmarks/**/runs/
+benchmarks/**/figures/
+benchmarks/latest_figures/
+benchmarks/**/*.json
+benchmarks/**/*.csv
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+.cache/
+.vscode/
+.idea/
+
+# Local paper and dataset artifacts
+*.pdf
+*.obj
+*.dt
+*.pre
+*.csv
+!baselines/face/data/cube.obj

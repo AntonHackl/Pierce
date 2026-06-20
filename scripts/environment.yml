@@ -1,0 +1,34 @@
+name: pierce_microns
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - cloud-volume
+      - cloud-files
+      - caveclient
+      - trimesh
+      - numpy
+      - pandas
+      - ipython
+      - tqdm
+      - DracoPy
+      - networkx
+      - google-cloud-storage
+      - boto3
+      - botocore
+      - simplejpeg
+      - zstandard
+      - brotli
+      - deflate
+      - crc32c
+      - intervaltree
+      - osteoid
+      - microviewer
+      - compressed_segmentation
+      - pyarrow
+      - pytest
+      - huggingface_hub
+      - kagglehub

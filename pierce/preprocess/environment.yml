@@ -1,0 +1,18 @@
+name: pierce_preprocess
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  # Core
+  - python=3.11
+  - cmake>=3.25
+  - ninja
+  
+  # CUDA
+  - cuda-toolkit=12.8
+  
+  # C++ Libraries
+  - cgal>=6.0
+  - tinyobjloader
+  - boost-cpp
+  - eigen

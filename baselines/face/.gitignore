@@ -1,0 +1,11 @@
+build/
+*.o
+*.so
+*.a
+cgal_query
+*.log
+.vscode/
+.idea/
+*.swp
+*~
+data/*.wkt

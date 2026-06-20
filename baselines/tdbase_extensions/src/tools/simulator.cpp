@@ -1,0 +1,655 @@
+/*
+ * data_generator.cpp
+ *
+ *  Created on: Nov 27, 2019
+ *      Author: teng
+ *
+ *  generate testing data by duplicating some given examples
+ *
+ */
+
+#include <fstream>
+#include <cstdio>
+#include <tuple>
+#include <chrono>
+#include "himesh.h"
+#include "tile.h"
+#include "popl.h"
+#include "preprocess_timing.h"
+
+using namespace tdbase;
+using namespace std;
+using namespace popl;
+
+namespace tdbase{
+// 50M for each vessel and the nucleis around it
+const int buffer_size = 50*(1<<20);
+HiMesh *vessel = NULL;
+HiMesh *nuclei = NULL;
+
+map<int, HiMesh *> vessels;
+map<int, HiMesh *> nucleis;
+
+aab nuclei_box;
+aab vessel_box;
+
+bool *vessel_taken;
+int total_slots = 0;
+
+int num_nuclei_per_vessel = 100;
+int num_vessel = 50;
+int voxel_size = NUM_FACET_PER_VOXEL;
+
+vector<HiMesh_Wrapper *> generated_nucleis;
+vector<HiMesh_Wrapper *> generated_vessels;
+
+pthread_mutex_t mylock;
+pthread_mutex_t output_lock;
+
+bool multi_lods = false;
+bool allow_intersection = false;
+bool stream_compressed_output = false;
+
+ofstream nuclei_stream;
+ofstream vessel_stream;
+string nuclei_tmp_output_path;
+string vessel_tmp_output_path;
+
+void write_compressed_wrapper(ofstream &os, HiMesh_Wrapper *wr, preprocess_target target) {
+	assert(wr);
+	assert(wr->type == COMPRESSED);
+	const auto write_start = std::chrono::steady_clock::now();
+	HiMesh *mesh = wr->get_mesh();
+	size_t size = mesh->get_data_size();
+	os.write((char *)&size, sizeof(size_t));
+	os.write(mesh->get_data(), mesh->get_data_size());
+	size = wr->voxels.size();
+	os.write((char *)&size, sizeof(size_t));
+	for (Voxel *v : wr->voxels) {
+		os.write((char *)v->low, 3 * sizeof(float));
+		os.write((char *)v->high, 3 * sizeof(float));
+		os.write((char *)v->core, 3 * sizeof(float));
+	}
+	const auto write_end = std::chrono::steady_clock::now();
+	const auto elapsed_ns = static_cast<std::uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(write_end - write_start).count()
+	);
+	g_write_ns.fetch_add(elapsed_ns);
+	write_target_ns(target).fetch_add(elapsed_ns);
+}
+
+void emit_generated_wrapper(HiMesh_Wrapper *wr, bool is_nuclei) {
+	if (stream_compressed_output) {
+		pthread_mutex_lock(&output_lock);
+		write_compressed_wrapper(
+			is_nuclei ? nuclei_stream : vessel_stream,
+			wr,
+			is_nuclei ? preprocess_target::nuclei : preprocess_target::vessel
+		);
+		pthread_mutex_unlock(&output_lock);
+		delete wr;
+		return;
+	}
+
+	pthread_mutex_lock(&mylock);
+	if (is_nuclei) {
+		generated_nucleis.push_back(wr);
+	}
+	else {
+		generated_vessels.push_back(wr);
+	}
+	pthread_mutex_unlock(&mylock);
+}
+
+void open_streamed_output(const char *final_path, string &tmp_path, ofstream &os) {
+	tmp_path = string(final_path) + ".tmp";
+	remove(tmp_path.c_str());
+	os.open(tmp_path, ios::out | ios::binary | ios::trunc);
+	assert(os.is_open());
+	char type = (char)COMPRESSED;
+	os.write(&type, 1);
+}
+
+void finalize_streamed_output(
+	const string &tmp_path,
+	const char *final_path,
+	ofstream &os,
+	preprocess_target target
+) {
+	const auto finalize_start = std::chrono::steady_clock::now();
+	os.close();
+	remove(final_path);
+	int status = rename(tmp_path.c_str(), final_path);
+	assert(status == 0);
+	const auto finalize_end = std::chrono::steady_clock::now();
+	const auto elapsed_ns = static_cast<std::uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(finalize_end - finalize_start).count()
+	);
+	g_finalize_ns.fetch_add(elapsed_ns);
+	finalize_target_ns(target).fetch_add(elapsed_ns);
+}
+
+void load_prototype(const char *nuclei_path, const char *vessel_path){
+
+	// load the vessel
+	if(multi_lods){
+		char path[256];
+		for(int lod=100;lod>=20;lod-=20){
+			sprintf(path, "%s_%d.off", vessel_path, lod);
+			log("loading %s",path);
+			HiMesh *m = read_mesh(path);
+			assert(m);
+			vessels[lod] = m;
+			if(lod == 100){
+				vessel = m;
+			}
+		}
+	}else {
+		vessel = read_mesh(vessel_path);
+	}
+	assert(vessel);
+	aab mbb = vessel->get_mbb();
+	vessel_box = vessel->shift(-mbb.low[0], -mbb.low[1], -mbb.low[2]);
+
+	// load the nuclei
+	if(multi_lods){
+		char path[256];
+		// load the nuclei
+		for(int lod=100;lod>=20;lod-=20){
+			sprintf(path, "%s_%d.off", nuclei_path, lod);
+			log("loading %s",path);
+			HiMesh *m = read_mesh(path);
+			assert(m);
+			nucleis[lod] = m;
+			if(lod == 100){
+				nuclei = m;
+			}
+		}
+	}else{
+		nuclei = read_mesh(nuclei_path);
+	}
+	assert(nuclei);
+	if (allow_intersection) {
+		nuclei->expand(3);
+	}
+	mbb = nuclei->get_mbb();
+	nuclei_box = nuclei->shift(-mbb.low[0], -mbb.low[1], -mbb.low[2]);
+
+	// how many slots in each dimension can one vessel holds
+	int nuclei_num[3];
+	for(int i=0;i<3;i++){
+		nuclei_num[i] = (int)(vessel_box.high[i]/nuclei_box.high[i]);
+	}
+
+	total_slots = nuclei_num[0]*nuclei_num[1]*nuclei_num[2];
+	vessel_taken = new bool[total_slots];
+	for(int i=0;i<total_slots;i++){
+		vessel_taken[i] = false;
+	}
+
+	// just for mark the voxels that are taken
+	vector<Voxel *> vessel_voxels = vessel->generate_voxels_skeleton(50);
+
+	for(Voxel *v:vessel_voxels){
+		int xstart = v->low[0]/vessel_box.high[0]*nuclei_num[0];
+		int xend = v->high[0]/vessel_box.high[0]*nuclei_num[0];
+		int ystart = v->low[1]/vessel_box.high[1]*nuclei_num[1];
+		int yend = v->high[1]/vessel_box.high[1]*nuclei_num[1];
+		int zstart = v->low[2]/vessel_box.high[2]*nuclei_num[2];
+		int zend = v->high[2]/vessel_box.high[2]*nuclei_num[2];
+
+		xend = min(xend, nuclei_num[0]-1);
+		yend = min(yend, nuclei_num[1]-1);
+		zend = min(zend, nuclei_num[2]-1);
+
+		//log("%d %d, %d %d, %d %d", xstart, xend, ystart, yend, zstart, zend);
+		for(int z=zstart;z<=zend;z++){
+			for(int y=ystart;y<=yend;y++){
+				for(int x=xstart;x<=xend;x++){
+					assert(z*nuclei_num[0]*nuclei_num[1]+y*nuclei_num[0]+x < total_slots);
+					vessel_taken[z*nuclei_num[0]*nuclei_num[1]+y*nuclei_num[0]+x] = true;
+				}
+			}
+		}
+	}
+}
+
+HiMesh_Wrapper *organize_data(HiMesh *mesh, float shift[3], preprocess_target target){
+
+	HiMesh *local_mesh = mesh->clone_mesh();
+	local_mesh->shift(shift[0], shift[1], shift[2]);
+
+	const auto wrapper_start = std::chrono::steady_clock::now();
+	HiMesh_Wrapper *wr = new HiMesh_Wrapper(local_mesh, voxel_size);
+	const auto wrapper_end = std::chrono::steady_clock::now();
+	const auto elapsed_ns = static_cast<std::uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(wrapper_end - wrapper_start).count()
+	);
+	g_wrapper_total_ns.fetch_add(elapsed_ns);
+	wrapper_target_ns(target).fetch_add(elapsed_ns);
+	return wr;
+}
+
+HiMesh_Wrapper *organize_data(map<int, HiMesh *> &meshes, float shift[3], preprocess_target target){
+
+	map<int, HiMesh *> local_meshes;
+
+	for(auto m:meshes){
+		HiMesh *nmesh = m.second->clone_mesh();
+		nmesh->shift(shift[0], shift[1], shift[2]);
+		local_meshes[m.first] = nmesh;
+	}
+
+	const auto wrapper_start = std::chrono::steady_clock::now();
+	HiMesh_Wrapper *wr = new HiMesh_Wrapper(local_meshes,voxel_size);
+	const auto wrapper_end = std::chrono::steady_clock::now();
+	const auto elapsed_ns = static_cast<std::uint64_t>(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(wrapper_end - wrapper_start).count()
+	);
+	g_wrapper_total_ns.fetch_add(elapsed_ns);
+	wrapper_target_ns(target).fetch_add(elapsed_ns);
+	return wr;
+}
+
+/*
+ * generate the binary data of nucleis around vessel with
+ * a given shift base
+ *
+ * */
+int generate_nuclei(float base[3]){
+	int nuclei_num[3];
+	for(int i=0;i<3;i++){
+		nuclei_num[i] = (int)(vessel_box.high[i]/nuclei_box.high[i]);
+	}
+	float shift[3];
+	int generated = 0;
+	bool *taken = new bool[total_slots];
+	memcpy(taken, vessel_taken, total_slots*sizeof(bool));
+
+	int available_count = 0;
+	for(int i=0;i<total_slots;i++){
+		if(!vessel_taken[i]){
+			available_count++;
+		}
+	}
+	//log("%d %d %d",total_slots,num_nuclei_per_vessel,available_count);
+	assert(available_count>num_nuclei_per_vessel && "should have enough slots");
+
+	if (!allow_intersection) {
+		const int gap = available_count / num_nuclei_per_vessel;
+
+		int skipped = 0;
+		int idx = 0;
+
+		while (idx < total_slots) {
+			if (taken[idx]) {
+				idx++;
+				continue;
+			}
+			if (skipped++ == gap) {
+				generated++;
+				skipped = 0;
+				taken[idx] = true;
+
+				int z = idx / (nuclei_num[0] * nuclei_num[1]);
+				int y = (idx % (nuclei_num[0] * nuclei_num[1])) / nuclei_num[0];
+				int x = (idx % (nuclei_num[0] * nuclei_num[1])) % nuclei_num[0];
+
+				shift[0] = x * nuclei_box.high[0] + base[0];
+				shift[1] = y * nuclei_box.high[1] + base[1];
+				shift[2] = z * nuclei_box.high[2] + base[2];
+
+				HiMesh_Wrapper* wr;
+				if (multi_lods) {
+					wr = organize_data(nucleis, shift, preprocess_target::nuclei);
+				}
+				else {
+					wr = organize_data(nuclei, shift, preprocess_target::nuclei);
+				}
+
+				emit_generated_wrapper(wr, true);
+			}
+			idx++;
+		}
+	}
+	else {
+		while (generated++<num_nuclei_per_vessel) {
+			shift[0] = tdbase::get_rand_double() * vessel_box.high[0] + base[0];
+			shift[1] = tdbase::get_rand_double() * vessel_box.high[1] + base[1];
+			shift[2] = tdbase::get_rand_double() * vessel_box.high[2] + base[2];
+			HiMesh_Wrapper* wr;
+			if (multi_lods) {
+				wr = organize_data(nucleis, shift, preprocess_target::nuclei);
+			}
+			else {
+				wr = organize_data(nuclei, shift, preprocess_target::nuclei);
+			}
+			emit_generated_wrapper(wr, true);
+		}
+	}
+	
+	delete []taken;
+	return generated;
+}
+
+queue<tuple<float, float, float>> jobs;
+
+long global_generated = 0;
+
+void *generate_unit(void *arg){
+	bool complete = false;
+	while(true){
+		tuple<float, float, float> job;
+		pthread_mutex_lock(&mylock);
+		complete = jobs.empty();
+		if(!complete){
+			job = jobs.front();
+			jobs.pop();
+			log("%ld jobs left", jobs.size());
+		}
+		pthread_mutex_unlock(&mylock);
+		if(complete){
+			break;
+		}
+		size_t offset = 0;
+		size_t vessel_offset = 0;
+		float base[3] = {get<0>(job), get<1>(job), get<2>(job)};
+		int generated = generate_nuclei(base);
+
+		HiMesh_Wrapper *wr;
+		if(multi_lods){
+			wr = organize_data(vessels, base, preprocess_target::vessel);
+		}else{
+			wr = organize_data(vessel, base, preprocess_target::vessel);
+		}
+		emit_generated_wrapper(wr, false);
+		pthread_mutex_lock(&mylock);
+		global_generated += generated;
+		pthread_mutex_unlock(&mylock);
+	}
+	return NULL;
+}
+
+void simulator(int argc, char **argv){
+	string nuclei_pt;
+	string vessel_pt;
+	string output_path;
+	int num_threads;
+
+	pthread_mutex_init(&mylock, NULL);
+	pthread_mutex_init(&output_lock, NULL);
+
+	OptionParser op("Simulator");
+	auto help_option = op.add<Switch>("h", "help", "produce help message");
+	op.add<Value<int>>("t", "threads", "number of threads", tdbase::get_num_threads(), &num_threads);
+	op.add<Value<int>>("", "verbose", "verbose level",0, &config.verbose);
+
+	auto allow_intersection_option = op.add<Switch>("i", "allow_intersection", "allow the nuclei to intersect with other nuclei or vessel",&allow_intersection);
+	op.add<Value<string>>("n", "nuclei", "path to the nuclei prototype file", "nuclei.pt", &nuclei_pt);
+	op.add<Value<string>>("v", "vessel", "path to the vessel prototype file", "vessel.pt", &vessel_pt);
+	auto multi_lods_option = op.add<Switch>("m", "multi_lods", "the input are polyhedrons in multiple files", &multi_lods);
+
+	op.add<Value<string>>("o", "output", "prefix of the output files", "default", &output_path);
+	op.add<Value<int>>("", "nv", "number of vessels", 50, &num_vessel);
+	op.add<Value<int>>("", "nu", "number of nucleis per vessel", 100, &num_nuclei_per_vessel);
+
+	auto hausdorff_option = op.add<Switch>("", "hausdorff", "enable Hausdorff distance calculation", &HiMesh::use_hausdorff);
+	op.add<Value<uint32_t>>("r", "sample_rate", "sampling rate for Hausdorff distance calculation", 30, &HiMesh::sampling_rate);
+	op.add<Value<int>>("", "vs", "number of vertices in each voxel", NUM_FACET_PER_VOXEL, &voxel_size);
+
+	op.parse(argc, argv);
+
+	struct timeval start = get_cur_time();
+	reset_preprocess_timing();
+
+	char vessel_output[256];
+	char nuclei_output[256];
+	char config[100];
+	sprintf(config,"nv%d_nu%d_vs%d_r%d",
+			num_vessel, num_nuclei_per_vessel, voxel_size,
+			HiMesh::sampling_rate);
+
+	sprintf(vessel_output,"%s_v_%s.dt",output_path.c_str(),config);
+	sprintf(nuclei_output,"%s_n_%s.dt",output_path.c_str(),config);
+
+	// generate some job for worker to process
+	int dim1 = (int)(pow((float)num_vessel, (float)1.0/3)+0.5);
+	int dim2 = dim1;
+	int dim3 = num_vessel/(dim1*dim2);
+	int x_dim,y_dim,z_dim;
+	if(vessel_box.high[0]-vessel_box.low[0] > vessel_box.high[1]-vessel_box.low[1] && vessel_box.high[0]-vessel_box.low[0] > vessel_box.high[2]-vessel_box.low[2] ){
+		x_dim = min(dim1, dim3);
+		y_dim = max(dim1, dim3);
+		z_dim = max(dim1, dim3);
+	}else if(vessel_box.high[1]-vessel_box.low[1] > vessel_box.high[0]-vessel_box.low[0] && vessel_box.high[1]-vessel_box.low[1] > vessel_box.high[2]-vessel_box.low[2] ){
+		y_dim = min(dim1, dim3);
+		x_dim = max(dim1, dim3);
+		z_dim = max(dim1, dim3);
+	}else{
+		z_dim = min(dim1, dim3);
+		x_dim = max(dim1, dim3);
+		y_dim = max(dim1, dim3);
+	}
+	load_prototype(nuclei_pt.c_str(), vessel_pt.c_str());
+	logt("load prototype files", start);
+
+	stream_compressed_output = !multi_lods;
+	if (stream_compressed_output) {
+		open_streamed_output(nuclei_output, nuclei_tmp_output_path, nuclei_stream);
+		open_streamed_output(vessel_output, vessel_tmp_output_path, vessel_stream);
+	}
+
+	for(int i=0;i<x_dim;i++){
+		for(int j=0;j<y_dim;j++){
+			for(int k=0;k<z_dim;k++){
+				tuple<float, float, float> tp(i*vessel_box.high[0], j*vessel_box.high[1], k*vessel_box.high[2]);
+				jobs.push(tp);
+			}
+		}
+	}
+	size_t vessel_num = jobs.size();
+
+	pthread_t threads[num_threads];
+	for(int i=0;i<num_threads;i++){
+		pthread_create(&threads[i], NULL, generate_unit, NULL);
+	}
+	for(int i = 0; i < num_threads; i++ ){
+		void *status;
+		pthread_join(threads[i], &status);
+	}
+	logt("%ld vessels %ld nucleis are generated",start,vessel_num,global_generated);
+	const auto preprocess_before_finalize_ms = preprocessing_only_ms();
+
+	if(stream_compressed_output){
+		finalize_streamed_output(
+			nuclei_tmp_output_path,
+			nuclei_output,
+			nuclei_stream,
+			preprocess_target::nuclei
+		);
+		finalize_streamed_output(
+			vessel_tmp_output_path,
+			vessel_output,
+			vessel_stream,
+			preprocess_target::vessel
+		);
+	}else{
+		Tile *nuclei_tile = new Tile(generated_nucleis);
+		Tile *vessel_tile = new Tile(generated_vessels);
+		nuclei_tile->dump_raw(nuclei_output);
+		vessel_tile->dump_raw(vessel_output);
+	}
+	log(
+		"preprocess_timing_ms wrapper_total=%.3f write=%.3f finalize=%.3f preprocessing_only=%.3f streaming=%d",
+		wrapper_total_ms(),
+		write_ms(),
+		finalize_ms(),
+		stream_compressed_output ? preprocessing_only_ms() : preprocess_before_finalize_ms,
+		stream_compressed_output ? 1 : 0
+	);
+	log(
+		"preprocess_timing_ms dataset_kind=n output=%s wrapper_total=%.3f write=%.3f finalize=%.3f preprocessing_only=%.3f streaming=%d",
+		nuclei_output,
+		wrapper_total_ms(preprocess_target::nuclei),
+		write_ms(preprocess_target::nuclei),
+		finalize_ms(preprocess_target::nuclei),
+		preprocessing_only_ms(preprocess_target::nuclei),
+		stream_compressed_output ? 1 : 0
+	);
+	log(
+		"preprocess_timing_ms dataset_kind=v output=%s wrapper_total=%.3f write=%.3f finalize=%.3f preprocessing_only=%.3f streaming=%d",
+		vessel_output,
+		wrapper_total_ms(preprocess_target::vessel),
+		write_ms(preprocess_target::vessel),
+		finalize_ms(preprocess_target::vessel),
+		preprocessing_only_ms(preprocess_target::vessel),
+		stream_compressed_output ? 1 : 0
+	);
+
+	// clear
+	delete vessel;
+	delete nuclei;
+	delete []vessel_taken;
+}
+
+/*
+ * generate the binary data of nucleis around vessel with
+ * a given shift base
+ *
+ * */
+
+int amplify_ratio = 10;
+int num_nuclei = 10000;
+
+void load_prototype(const char *nuclei_path){
+
+	// load the nuclei
+	if(multi_lods){
+		char path[256];
+		// load the nuclei
+		for(int lod=100;lod>=20;lod-=20){
+			sprintf(path, "%s_%d.off", nuclei_path, lod);
+			log("loading %s",path);
+			HiMesh *m = read_mesh(path);
+			assert(m);
+			nucleis[lod] = m;
+			if(lod == 100){
+				nuclei = m;
+			}
+		}
+	}else{
+		nuclei = read_mesh(nuclei_path);
+	}
+	assert(nuclei);
+	auto mbb = nuclei->get_mbb();
+	nuclei_box = nuclei->shift(-mbb.low[0], -mbb.low[1], -mbb.low[2]);
+}
+
+void* generate_unit_int(void* arg) {
+	log("thread is started");
+
+	bool stop = false;
+	float shift[3];
+	while(!stop){
+
+		shift[0] = tdbase::get_rand_double() * nuclei_box.high[0] * amplify_ratio;
+		shift[1] = tdbase::get_rand_double() * nuclei_box.high[1] * amplify_ratio;
+		shift[2] = tdbase::get_rand_double() * nuclei_box.high[2] * amplify_ratio;
+
+		HiMesh_Wrapper *wr;
+		if(multi_lods){
+			wr = organize_data(nucleis, shift, preprocess_target::nuclei);
+		}else{
+			wr = organize_data(nuclei, shift, preprocess_target::nuclei);
+		}
+
+		pthread_mutex_lock(&mylock);
+		if (generated_nucleis.size()<num_nuclei) {
+			generated_nucleis.push_back(wr);
+		}
+		else {
+			delete wr;
+			stop = true;
+		}
+		pthread_mutex_unlock(&mylock);
+	}
+	return NULL;
+}
+
+void simulator_int(int argc, char **argv){
+
+// argument parsing
+	string nuclei_pt;
+	string output_path;
+	int num_threads;
+
+
+	OptionParser op("Simulator");
+	auto help_option = op.add<Switch>("h", "help", "produce help message");
+	auto hausdorff_option = op.add<Switch>("", "hausdorff", "enable Hausdorff distance calculation", &HiMesh::use_hausdorff);
+	auto multi_lods_option = op.add<Switch>("m", "multi_lods", "the input are polyhedrons in multiple files", &multi_lods);
+	op.add<Value<string>>("n", "nuclei", "path to the nuclei prototype file", "nuclei.pt", &nuclei_pt);
+	op.add<Value<string>>("o", "output", "prefix of the output files", "default", &output_path);
+	op.add<Value<int>>("t", "threads", "number of threads", tdbase::get_num_threads(), &num_threads);
+	op.add<Value<int>>("", "amplify_ratio", "how big, in terms of nuclei size, in each dimension", 10, &amplify_ratio);
+	op.add<Value<int>>("", "n", "number of nuclei", 10000, &num_nuclei);
+	op.add<Value<int>>("", "verbose", "verbose level", 0, &config.verbose);
+	op.add<Value<uint32_t>>("r", "sample_rate", "sampling rate for Hausdorff distance calculation", 30, &HiMesh::sampling_rate);
+	op.parse(argc, argv);
+
+// processing section
+
+	struct timeval start = get_cur_time();
+	reset_preprocess_timing();
+
+	pthread_mutex_init(&mylock, NULL);
+	char nuclei_output[256];
+	char config[100];
+	sprintf(config,"nu%d_%d_r%d",
+			num_nuclei,amplify_ratio, HiMesh::sampling_rate);
+
+	sprintf(nuclei_output,"%s_n_%s.dt",output_path.c_str(),config);
+
+	load_prototype(nuclei_pt.c_str());
+	logt("load prototype files", start);
+
+	pthread_t threads[num_threads];
+	for(int i=0;i<num_threads;i++){
+		pthread_create(&threads[i], NULL, generate_unit_int, NULL);
+	}
+	for(int i = 0; i < num_threads; i++ ){
+		void *status;
+		pthread_join(threads[i], &status);
+	}
+	logt("%ld nucleis are generated",start, generated_nucleis.size());
+	const auto preprocess_before_finalize_ms = preprocessing_only_ms();
+
+	Tile *nuclei_tile = new Tile(generated_nucleis);
+
+	if(multi_lods){
+		nuclei_tile->dump_raw(nuclei_output);
+	}else{
+		nuclei_tile->dump_compressed(nuclei_output);
+	}
+	log(
+		"preprocess_timing_ms wrapper_total=%.3f write=%.3f finalize=%.3f preprocessing_only=%.3f streaming=%d",
+		wrapper_total_ms(),
+		write_ms(),
+		finalize_ms(),
+		preprocess_before_finalize_ms,
+		0
+	);
+	log(
+		"preprocess_timing_ms dataset_kind=n output=%s wrapper_total=%.3f write=%.3f finalize=%.3f preprocessing_only=%.3f streaming=%d",
+		nuclei_output,
+		wrapper_total_ms(preprocess_target::nuclei),
+		write_ms(preprocess_target::nuclei),
+		finalize_ms(preprocess_target::nuclei),
+		preprocessing_only_ms(preprocess_target::nuclei),
+		0
+	);
+
+	// clear
+	delete nuclei;
+}
+}

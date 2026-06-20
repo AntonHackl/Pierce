@@ -1,0 +1,17 @@
+name: pierce_query
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  # Core
+  - python=3.11
+  - cmake>=3.18
+  - ninja
+  
+  # CUDA
+  - cuda-toolkit=12.8
+  
+  # C++ Libraries
+  - cgal
+  - boost-cpp
+  - eigen

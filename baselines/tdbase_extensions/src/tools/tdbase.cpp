@@ -1,0 +1,677 @@
+/*
+ * 3dpro_tool.cpp
+ *
+ *  Created on: Mar 29, 2022
+ *      Author: teng
+ */
+
+#include <algorithm>
+#include <thread>
+#include <map>
+
+#include "SpatialJoin.h"
+#include "himesh.h"
+#include "tile.h"
+#include "util.h"
+
+using namespace std;
+using namespace tdbase;
+
+namespace tdbase{
+
+	map<string, void (*)(int, char **)> functions;
+
+/*
+ * print himesh to wkt
+ *
+ * */
+static void to_wkt(int argc, char **argv){
+	Tile *tile = new Tile(argv[1]);
+	const char *prefix = argv[2];
+	tile->decode_all(100);
+	char path[256];
+	for(int i=0;i<tile->num_objects();i++){
+		sprintf(path, "%s_%d.OFF", prefix, i);
+		tile->get_mesh(i)->write_to_off(path);
+	}
+	delete tile;
+}
+
+/*
+ * print himesh to sql
+ *
+ * */
+static void to_sql(int argc, char **argv){
+
+	Tile *tile = new Tile(argv[1]);
+	char table[100];
+	for(int i=20;i<=100;i+=20){
+		tile->decode_all(i);
+		char path[256];
+		sprintf(table, "%s_%d",argv[2],i);
+		sprintf(path, "%s.sql",table);
+		tile->dump_sql(path, table);
+	}
+	delete tile;
+}
+
+/*
+ * get the voxel boxes
+ * */
+static void get_voxel_boxes(int argc, char **argv){
+	struct timeval start = get_cur_time();
+	HiMesh *mesh = read_mesh(argv[1], false);
+	int voxel_size = 100;
+	if(argc>=4){
+		voxel_size = atoi(argv[3]);
+	}
+	vector<Voxel *> voxels = mesh->generate_voxels_skeleton(voxel_size);
+
+	float vol = 0.0;
+	for(Voxel *v:voxels){
+		vol += v->volume();
+	}
+
+	write_voxels(voxels, argv[2]);
+	delete mesh;
+
+	logt("%ld voxels are generated %f volume", start, voxels.size(), vol);
+}
+
+/*
+ * get the skeleton points
+ * */
+static void get_skeleton(int argc, char **argv){
+	assert(argc>2);
+	struct timeval start = get_cur_time();
+	HiMesh *mesh = read_mesh(argv[1], false);
+	int voxel_num = 100;
+	if(argc>3){
+		voxel_num = atoi(argv[3]);
+	}
+	logt("load mesh", start);
+	vector<Point> skeleton = mesh->get_skeleton_points(voxel_num);
+	logt("get skeleton", start);
+
+	tdbase::write_points(skeleton, argv[2]);
+
+	log("%ld points in the skeleton", skeleton.size());
+	skeleton.clear();
+	delete mesh;
+}
+
+/*
+ * get the voxel boxes
+ * */
+static void voxelize(int argc, char **argv){
+	assert(argc>2);
+	struct timeval start = get_cur_time();
+	HiMesh *mesh = read_mesh(argv[1], false);
+	int voxel_num = 100;
+	if(argc>3){
+		voxel_num = atoi(argv[3]);
+	}
+	vector<Voxel *> voxels = mesh->voxelization(voxel_num);
+	float vol = 0.0;
+	for(Voxel *v:voxels){
+		vol += v->volume();
+	}
+
+	log("%ld voxels are generated %f volumn", voxels.size(), vol);
+
+	write_voxels(voxels, argv[2]);
+	delete mesh;
+}
+
+/*
+ * get the distances between the objects in two tiles with different LODs
+ *
+ * */
+static void profile_distance(int argc, char **argv){
+
+	Tile *tile1 = new Tile(argv[1]);
+	Tile *tile2 = new Tile(argv[2]);
+
+	for(int i=10;i<=100;i+=10){
+		tile1->decode_all(i);
+		tile2->decode_all(i);
+		double dist = 0;
+		for(int j=0;j<tile2->num_objects();j++) {
+			float d = tile1->get_mesh(0)->distance(tile2->get_mesh(j));
+			dist += sqrt(d);
+		}
+		printf("%d %f\n",i,dist/tile2->num_objects());
+	}
+
+	delete tile1;
+	delete tile2;
+}
+
+/*
+ * profiling the performance of decoding
+ * */
+static void profile_decoding(int argc, char **argv){
+
+	int start_lod = 0;
+	int end_lod = 10;
+	if(argc>2){
+		start_lod = atoi(argv[2]);
+		end_lod = start_lod;
+	}
+	assert(start_lod>=0&&start_lod<=10);
+	// Init the random number generator.
+	log("start compressing");
+	struct timeval starttime = get_cur_time();
+	HiMesh *compressed = read_mesh(argv[1], true);
+	//assert(compressed->size_of_border_edges()&&"must be manifold");
+	logt("compress", starttime);
+
+	const int itertime = 5;
+
+	HiMesh *testc[itertime];
+	struct timeval sst = get_cur_time();
+	for(int i=0;i<itertime;i++){
+		testc[i] = read_mesh(argv[1], true);
+	}
+	logt("compress to %d vertices %d edges %d faces",sst,compressed->size_of_vertices(), compressed->size_of_halfedges()/2, compressed->size_of_triangles());
+
+	log("start decompressing");
+
+	char path[256];
+	for(int i=start_lod;i<=end_lod;i++){
+		int lod = 10*i;
+		HiMesh *tested[itertime];
+		for(int t=0;t<itertime;t++){
+			tested[t] = new HiMesh(compressed);
+		}
+		starttime = get_cur_time();
+		for(int t=0;t<itertime;t++){
+			tested[t]->decode(lod);
+		}
+		double testedtime = get_time_elapsed(starttime,true);
+		logt("decompress %3d lod %5d vertices %5d edges %5d faces avg(%.4f)", starttime, lod,
+				tested[0]->size_of_vertices(), tested[0]->size_of_halfedges()/2, tested[0]->size_of_triangles(), testedtime/itertime);
+		sprintf(path,"/gisdata/lod.%d.off", lod);
+		tested[0]->write_to_off(path);
+		for(int t=0;t<itertime;t++){
+			delete tested[t];
+		}
+	}
+	starttime = get_cur_time();
+	HiMesh *himesh = new HiMesh(compressed);
+	himesh->decode(100);
+	logt("decompress", starttime);
+	float *vertices = NULL;
+	size_t size = himesh->fill_vertices(vertices);
+	logt("fill vertices %d with %d bytes (%ld bytes)", starttime, size, size*3*sizeof(float),himesh->get_data_size());
+	
+	aab box = himesh->get_mbb();
+	tdbase::write_box(box, "/gisdata/box.off");
+
+	delete himesh;
+	delete compressed;
+	delete []vertices;
+}
+
+static void aabb(int argc, char **argv){
+	struct timeval start = get_cur_time();
+
+	int num = 10000;
+	if(argc>3){
+		num = atoi(argv[3]);
+	}
+
+	Tile *tile1 = new Tile(argv[1], num);
+	Tile *tile2 = new Tile(argv[2],1);
+	tile1->decode_all(100);
+	logt("load tiles", start);
+
+	char c;
+	std::cin >> c;
+	start = get_cur_time();
+	for(int i=0;i<tile1->num_objects();i++){
+		HiMesh *mesh = tile1->get_mesh(i);
+		assert(mesh);
+		TriangleTree *tree = mesh->get_aabb_tree_triangle();
+		tree->build();
+		tree->accelerate_distance_queries();
+		//log("indexing %d",i);
+	}
+	logt("indexed %ld objects",start,tile1->num_objects());
+	std::cin >> c;
+	start = get_cur_time();
+
+	tile2->decode_all(100);
+	HiMesh *nuc = tile2->get_mesh(0);
+	list<Point> vertices = nuc->get_vertices();
+	double mdist = DBL_MAX;
+	for(int i=0;i<tile1->num_objects();i++){
+		HiMesh *mesh = tile1->get_mesh(i);
+		assert(mesh);
+		TriangleTree *tree = mesh->get_aabb_tree_triangle();
+		for(Point &p:vertices){
+			FT sqd = tree->squared_distance(p);
+			double dist = (double)CGAL::to_double(sqd);
+			mdist = std::min(mdist, dist);
+		}
+	}
+	logt("querying 1 %f", start, mdist);
+	std::cin >> c;
+	start = get_cur_time();
+	for(int i=0;i<tile1->num_objects();i++){
+		HiMesh *mesh = tile1->get_mesh(i);
+		assert(mesh);
+		TriangleTree *tree = mesh->get_aabb_tree_triangle();
+		for(Point &p:vertices){
+			FT sqd = tree->squared_distance(p);
+			double dist = (double)CGAL::to_double(sqd);
+			mdist = std::min(mdist, dist);
+		}
+	}
+	logt("querying 2 %f", start, mdist);
+	std::cin >> c;
+
+}
+
+
+/*
+ * adjust the size and the position of a polyhedron
+ * */
+static void adjust_polyhedron(int argc, char **argv){
+	if(argc<=3){
+		cout<<"usage: adjust shift shrink output_path"<<endl;
+		return;
+	}
+	float sft = atof(argv[1]);
+	float shrink = atof(argv[2]);
+	HiMesh *mesh = tdbase::read_mesh();
+	char path[256];
+	sprintf(path, "%s/original.off", argv[3]);
+	mesh->write_to_off(path);
+	mesh->shift(sft, sft, sft);
+	mesh->shrink(shrink);
+	sprintf(path, "%s/adjusted_%.2f_%.2f.off",argv[3],sft,shrink);
+	mesh->write_to_off(path);
+	delete mesh;
+}
+
+static void triangulate(int argc, char **argv){
+	HiMesh *mesh = read_mesh(argv[1], false);
+	Polyhedron *poly = mesh->to_triangulated_polyhedron();
+	tdbase::write_polyhedron(poly, argv[2]);
+
+	delete poly;
+	delete mesh;
+}
+
+static void sample(int argc, char **argv){
+
+	HiMesh::sampling_rate = atoi(argv[3]);
+	log("sampling rate %d", HiMesh::sampling_rate);
+
+	struct timeval start = get_cur_time();
+	HiMesh *mesh = read_mesh(argv[1]);
+
+	vector<Point> points;
+	points.assign(mesh->sampled_points.begin(), mesh->sampled_points.end());
+	tdbase::write_points(points, argv[2]);
+	delete mesh;
+}
+
+static void simplify(int argc, char **argv){
+
+
+}
+
+static void pack(int argc, char **argv){
+	if(argc < 3){
+		cout << "usage: pack output.dt input1.off [input2.off ...]" << endl;
+		return;
+	}
+
+	const char *output_path = argv[1];
+	vector<HiMesh_Wrapper *> wrappers;
+	wrappers.reserve(argc - 2);
+
+	for(int i=2; i<argc; ++i){
+		const char *off_path = argv[i];
+		HiMesh *mesh = read_mesh(off_path, false);
+		if(mesh == NULL){
+			cerr << "failed to read mesh: " << off_path << endl;
+			continue;
+		}
+		HiMesh_Wrapper *wrapper = new HiMesh_Wrapper(mesh);
+		wrappers.push_back(wrapper);
+	}
+
+	if(wrappers.empty()){
+		cerr << "no valid OFF meshes provided" << endl;
+		return;
+	}
+
+	Tile *tile = new Tile(wrappers);
+	tile->dump_compressed(output_path);
+	delete tile;
+}
+
+static void compress(int argc, char **argv){
+
+	std::string str(argv[1]);
+	config.verbose = 2;
+	if(argc>2){
+		HiMesh::sampling_rate = atoi(argv[2]);
+		log("%d",HiMesh::sampling_rate);
+	}
+
+	struct timeval start = get_cur_time();
+	HiMesh *mesh = read_mesh(argv[1], true);
+	logt("compress", start);
+	HiMesh *hm = new HiMesh(mesh);
+	int lod = 100;
+
+	char path[256];
+	std::string base_filename = str.substr(str.find_last_of("/\\") + 1, str.find_last_of('.') -str.find_last_of("/\\") - 1);
+
+	for(uint32_t i=20;i<=lod;i+=20){
+		hm->decode(i);
+		logt("decode to %d with %d vertices", start, i, hm->size_of_vertices());
+		//log("%d %f", i, himesh->getHausdorfDistance());
+	    sprintf(path, "%s_%d.off", base_filename.c_str(), i);
+	    hm->write_to_off(path);
+	}
+
+	delete mesh;
+	delete hm;
+}
+
+static void distance(int argc, char **argv){
+	assert(argc>4);
+	int n1 = atoi(argv[3]);
+	int n2 = atoi(argv[4]);
+
+	Tile *tile1 = new Tile(argv[1],n1+1);
+	Tile *tile2 = new Tile(argv[2],n2+1);
+
+	int lod = 100;
+	if(argc>5){
+		lod = atoi(argv[5]);
+	}
+
+	tile1->decode_all(lod);
+	tile2->decode_all(lod);
+
+	HiMesh *mesh1 = tile1->get_mesh(n1);
+	HiMesh *mesh2 = tile2->get_mesh(n2);
+	log("%f %f", mesh1->distance(mesh2), mesh1->distance_tree(mesh2));
+
+	delete tile1;
+	delete tile2;
+}
+
+static void intersect(int argc, char **argv){
+	assert(argc>4);
+	int n1 = atoi(argv[3]);
+	int n2 = atoi(argv[4]);
+
+	Tile *tile1 = new Tile(argv[1],n1+1);
+	Tile *tile2 = new Tile(argv[2],n2+1);
+
+	int lod = 100;
+	if(argc>5){
+		lod = atoi(argv[5]);
+	}
+
+	tile1->decode_all(lod);
+	tile2->decode_all(lod);
+
+	HiMesh *mesh1 = tile1->get_mesh(n1);
+	HiMesh *mesh2 = tile2->get_mesh(n2);
+	mesh1->get_segments();
+	log("%d %d", mesh1->intersect(mesh2), mesh1->intersect_tree(mesh2));
+
+	delete tile1;
+	delete tile2;
+}
+
+static void print(int argc, char **argv){
+	assert(argc>1);
+	int num = argc > 2 ? atoi(argv[2]) : 0;
+	Tile *tile = new Tile(argv[1],num+1);
+	assert(tile->num_objects()>num);
+	int lod = argc>3?atoi(argv[3]):100;
+	tile->get_mesh(num)->decode(lod);
+	cout<<*tile->get_mesh(num);
+	delete tile;
+}
+
+/*for evaluating the decoding efficiency*/
+static void decode(int argc, char **argv){
+	vector<Tile*> tiles;
+	struct timeval start = get_cur_time();
+	Tile* tile = new Tile(argv[1]);
+	logt("loading",start);
+	int num_thread = argc > 2? atoi(argv[2]):tdbase::get_num_threads();
+#pragma omp parallel for num_threads(num_thread)
+	for (int i = 0; i < tile->num_objects(); i++) {
+		HiMesh* mesh = tile->get_mesh(i);
+		mesh->decode(100);
+	}
+	delete tile;
+	logt("decoding", start);
+}
+
+static void print_tile_boxes(int argc, char **argv){
+	Tile *tile = new Tile(argv[1]);
+	vector<Voxel *> boxes;
+	for(int i=0;i<tile->num_objects();i++){
+		aab a = tile->get_mesh_wrapper(i)->box;
+		Voxel *vx = new Voxel();
+		for(int j=0;j<3;j++){
+			vx->low[j] = a.low[j];
+			vx->high[j] = a.high[j];
+		}
+		boxes.push_back(vx);
+	}
+	tdbase::write_voxels(boxes, argv[2]);
+}
+
+static void convert(int argc, char **argv){
+	Tile *tile = new Tile(argv[1]);
+	tile->dump_raw(argv[2]);
+	delete tile;
+}
+
+static void shrink(int argc, char **argv){
+	HiMesh *mesh = read_mesh(argv[1]);
+	mesh->shrink(atoi(argv[2]));
+	cout<<*mesh;
+}
+
+static void shift(int argc, char **argv){
+	HiMesh *mesh = read_mesh(argv[1]);
+	mesh->shift(mesh->get_mbb().length()/4, mesh->get_mbb().width()/4, mesh->get_mbb().height()/4);
+	cout<<*mesh;
+}
+
+static void hausdorff(int argc, char** argv) {
+	HiMesh* low = tdbase::read_mesh(argv[1], false);
+	HiMesh* high = tdbase::read_mesh(argv[2], false);
+	if (argc > 3) {
+		HiMesh::sampling_rate = atoi(argv[3]);
+	}
+	low->computeHausdorfDistance(high);
+	auto l = low->collectGlobalHausdorff(MIN);
+	auto a = low->collectGlobalHausdorff(AVG);
+	auto h = low->collectGlobalHausdorff(MAX);
+
+	log("proxy hausdorff [min	avg	max]=[%f	%f	%f]\n", l.first, a.first, h.first);
+	log("hausdorff [min	avg	max]=[%f	%f	%f]\n", l.second, a.second, h.second);
+}
+
+Configuration config;
+static void join(int argc, char **argv){
+	config = parse_args(argc, argv);
+
+	struct timeval start = get_cur_time();
+	HiMesh::use_byte_coding = !config.disable_byte_encoding;
+
+	Tile *tile1, *tile2;
+	if(config.tile2_path.size()>0){
+		tile1 = new Tile(config.tile1_path, config.max_num_objects1, false);
+		tile2 = new Tile(config.tile2_path, config.max_num_objects2, false);
+	}else{
+		tile1 = new Tile(config.tile1_path, config.max_num_objects1, false);
+		tile2 = tile1;
+	}
+	tile1->load();
+	if(tile2 != tile1){
+		tile2->load();
+	}
+	logt("load tiles", start);
+
+	SpatialJoin *joiner;
+	if(config.query_type=="intersect"){
+		joiner = new IntersectJoin();
+	}else if(config.query_type=="within"){
+		joiner = new DWithinJoin();
+	}else if(config.query_type=="nn"){
+		joiner = new KNNJoin();
+	}else{
+		log("error query type");
+		assert(false);
+	}
+	joiner->join(tile1, tile2);
+	logt("join tiles", start);
+
+	if(tile2 != tile1){
+		delete tile2;
+	}
+	delete tile1;
+	logt("clear tiles", start);
+	delete joiner;
+}
+
+struct PairHash {
+    size_t operator()(const pair<int, int>& p) const {
+        return hash<long long>()(
+            (static_cast<long long>(p.first) << 32) | (unsigned int)p.second
+        );
+    }
+};
+
+unordered_set<pair<int, int>, PairHash>
+load_pairs(const string& filename) {
+    unordered_set<pair<int, int>, PairHash> s;
+    ifstream fin(filename);
+    if (!fin) {
+        cerr << "Failed to open file: " << filename << endl;
+        exit(1);
+    }
+
+    int a, b;
+    while (fin >> a >> b) {
+        s.emplace(a, b);
+    }
+    return s;
+}
+
+static void evaluate(int argc, char* argv[]) {
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " ground_truth.txt prediction.txt\n";
+        return;
+    }
+
+    auto gt   = load_pairs(argv[1]);
+    auto pred = load_pairs(argv[2]);
+
+    vector<pair<int, int>> fp;
+    vector<pair<int, int>> fn;
+
+    size_t true_positive = 0;
+    for (const auto& p : pred) {
+        if (gt.count(p)) {
+            true_positive++;
+        }else{
+        	fp.push_back(pair<int,int>(p.first,p.second));
+        }
+    }
+
+    for (const auto& p : gt) {
+        if (!pred.count(p)) {
+        	fn.push_back(pair<int,int>(p.first,p.second));
+        }
+    }
+
+    sort(fp.begin(),fp.end());
+    sort(fn.begin(),fn.end());
+    if(fp.size()>0){
+    	cout<<"false positives:"<<endl;
+    	for(auto p:fp){
+        	cout<<p.first<<"\t"<<p.second<<endl;
+    	}
+    }
+    if(fn.size()>0){
+    	cout<<"false negative:"<<endl;
+    	for(auto p:fn){
+        	cout<<p.first<<"\t"<<p.second<<endl;
+    	}
+    }
+
+    double precision = pred.empty() ? 0.0 :
+        static_cast<double>(true_positive) / pred.size();
+    double recall = gt.empty() ? 0.0 :
+        static_cast<double>(true_positive) / gt.size();
+
+    cout << "True Positive: " << true_positive << endl;
+    cout << "Precision: " << precision << endl;
+    cout << "Recall: " << recall << endl;
+}
+
+extern void simulator(int argc, char **argv);
+extern void simulator_int(int argc, char **argv);
+
+}
+
+int main(int argc, char **argv){
+	// register the functions
+	functions["to_sql"] = to_sql;
+	functions["to_wkt"] = to_wkt;
+	functions["get_voxel_boxes"] = get_voxel_boxes;
+	functions["get_skeleton"] = get_skeleton;
+	functions["voxelize"] = voxelize;
+	functions["profile_decoding"] = profile_decoding;
+	functions["profile_distance"] = profile_distance;
+	functions["aabb"] = aabb;
+	functions["adjust_polyhedron"] = adjust_polyhedron;
+	functions["triangulate"] = triangulate;
+	functions["sample"] = sample;
+	functions["simplify"] = simplify;
+	functions["pack"] = pack;
+	functions["compress"] = compress;
+	functions["distance"] = distance;
+	functions["intersect"] = intersect;
+	functions["print"] = print;
+	functions["decode"] = decode;
+	functions["print_tile_boxes"] = print_tile_boxes;
+	functions["convert"] = convert;
+	functions["shrink"] = shrink;
+	functions["shift"] = shift;
+	functions["hausdorff"] = hausdorff;
+	functions["join"] = join;
+	functions["evaluate"] = evaluate;
+	functions["simulator"] = simulator;
+	functions["simulator_int"] = simulator_int;
+
+	if (argc < 2 || functions.find(argv[1])==functions.end()) {
+		cout <<"usage: tdbase (patched) function [args]"<<endl;
+		cout << "function could be:"<<endl;
+		for (auto e:functions) {
+			cout << e.first << " ";
+		}
+		cout << endl;
+		exit(0);
+	}
+	functions[argv[1]](argc-1, argv+1);
+
+	return 0;
+}

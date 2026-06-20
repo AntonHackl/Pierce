@@ -1,0 +1,27 @@
+name: pierce_query
+channels:
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  # Build tools
+  - python=3.11
+  - cmake>=3.18
+  - make
+  
+  # Compilers
+  - gxx_linux-64=11.4.0
+  - gcc_linux-64=11.4.0
+  - sysroot_linux-64
+  
+  # CUDA
+  - cuda-toolkit=12.8
+  
+  # C++ dependencies (older CGAL compatible with current setup)
+  - cgal-cpp>=6.0
+  - gmp
+  - mpfr
+  - eigen
+  
+  # Utilities
+  - pkg-config

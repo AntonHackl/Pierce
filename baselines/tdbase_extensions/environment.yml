@@ -1,0 +1,54 @@
+# Conda environment for building and running TDBase
+# This file is built to resolve the CGAL 6.0 / Python 3.12 conflict.
+# It explicitly pins Python to 3.11, which has a CGAL 6.0 build on conda-forge.
+
+name: tdbase_env
+channels:
+  - conda-forge # Use conda-forge as the primary, high-priority channel
+  - nvidia # For CUDA toolkit
+
+dependencies:
+  # ------------------------------------------------------------------
+  # Core Environment
+  # ------------------------------------------------------------------
+  # CRITICAL: Pin Python to a version compatible with cgal>=6.0
+  # CGAL 6.0 is not built for Python 3.12 on conda-forge.
+  - python=3.11
+
+  # ------------------------------------------------------------------
+  # Build Toolchain
+  # ------------------------------------------------------------------
+  - cmake>=3.25
+  - ninja
+  - make
+  - pkg-config
+
+  # ------------------------------------------------------------------
+  # C++ Compiler
+  # ------------------------------------------------------------------
+  # Explicitly pin GCC/G++ to 11.x. This is compatible with system CUDA 12.8
+  # and avoids conflicts with the default 'compilers' metapackage.
+  - gcc_linux-64=11.*
+  - gxx_linux-64=11.*
+
+  # ------------------------------------------------------------------
+  # Core C++ Libraries
+  # ------------------------------------------------------------------
+  # Use the C++ development package and the current split Boost packages.
+  - cgal-cpp>=6.0
+  - eigen
+  - gmp
+  - mpfr
+  - zlib # Explicitly requested dependency
+  - openmp # OpenMP support for parallel processing (GCC-compatible)
+
+  # ------------------------------------------------------------------
+  # GPU Toolchain
+  # ------------------------------------------------------------------
+  # Using cuda-toolkit 12.8 from nvidia channel to match system CUDA version
+  - cuda-toolkit=12.8
+
+  # ------------------------------------------------------------------
+  # Optional Utilities
+  # ------------------------------------------------------------------
+  - hdf5 # For auxiliary tools

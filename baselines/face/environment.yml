@@ -1,0 +1,15 @@
+name: cgal_spatial
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - make
+  - cmake
+  - ninja
+  - gxx_linux-64=12.*
+  - cgal-cpp
+  - eigen
+  - llvm-openmp
+  - libgomp
