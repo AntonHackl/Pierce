@@ -33,7 +33,8 @@ __global__ void compact_hash_pairs_kernel(
     unsigned long long capacity, 
     MeshQueryResult* output, 
     int* count_out, 
-    int max_output_size) 
+    int max_output_size,
+    int* overflow_out) 
 {
     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
     if (idx < capacity) {
@@ -45,7 +46,22 @@ __global__ void compact_hash_pairs_kernel(
                  int id2 = static_cast<int>(key & 0xFFFFFFFF);
                  output[pos].object_id_mesh1 = id1;
                  output[pos].object_id_mesh2 = id2;
+            } else if (overflow_out != nullptr) {
+                atomicExch(overflow_out, 1);
             }
+        }
+    }
+}
+
+__global__ void count_hash_pairs_kernel(
+    const unsigned long long* hash_table,
+    unsigned long long capacity,
+    unsigned long long* count_out)
+{
+    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (idx < capacity) {
+        if (hash_table[idx] != 0xFFFFFFFFFFFFFFFFULL) {
+            atomicAdd(count_out, 1ULL);
         }
     }
 }
@@ -122,25 +138,58 @@ long long merge_and_deduplicate_pairs_gpu(
 
 int compact_hash_table_pairs(
     const unsigned long long* d_hash_table, unsigned long long table_size,
-    MeshQueryResult* d_output, int max_output_size
+    MeshQueryResult* d_output, int max_output_size,
+    bool* overflowed_out
 ) {
     int* d_count;
+    int* d_overflow = nullptr;
     cudaMalloc(&d_count, sizeof(int));
     cudaMemset(d_count, 0, sizeof(int));
+    if (overflowed_out != nullptr) {
+        cudaMalloc(&d_overflow, sizeof(int));
+        cudaMemset(d_overflow, 0, sizeof(int));
+    }
     
     int threads = 256;
     int blocks = (table_size + threads - 1) / threads;
     
     compact_hash_pairs_kernel<<<blocks, threads>>>(
-        d_hash_table, table_size, d_output, d_count, max_output_size
+        d_hash_table, table_size, d_output, d_count, max_output_size, d_overflow
     );
     cudaDeviceSynchronize();
     
     int h_count = 0;
     cudaMemcpy(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost);
+    if (overflowed_out != nullptr) {
+        int h_overflow = 0;
+        cudaMemcpy(&h_overflow, d_overflow, sizeof(int), cudaMemcpyDeviceToHost);
+        *overflowed_out = (h_overflow != 0);
+        cudaFree(d_overflow);
+    }
     cudaFree(d_count);
     
     return (h_count < max_output_size) ? h_count : max_output_size;
+}
+
+unsigned long long count_hash_table_pairs(
+    const unsigned long long* d_hash_table,
+    unsigned long long table_size
+) {
+    unsigned long long* d_count;
+    cudaMalloc(&d_count, sizeof(unsigned long long));
+    cudaMemset(d_count, 0, sizeof(unsigned long long));
+
+    int threads = 256;
+    int blocks = static_cast<int>((table_size + threads - 1) / threads);
+
+    count_hash_pairs_kernel<<<blocks, threads>>>(d_hash_table, table_size, d_count);
+    cudaDeviceSynchronize();
+
+    unsigned long long h_count = 0;
+    cudaMemcpy(&h_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaFree(d_count);
+
+    return h_count;
 }
 
 } // extern "C"

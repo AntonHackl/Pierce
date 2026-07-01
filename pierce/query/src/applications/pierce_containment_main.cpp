@@ -352,14 +352,16 @@ int main(int argc, char* argv[]) {
                           numBObjects * sizeof(float3), cudaMemcpyHostToDevice));
 
     constexpr int kAnyhitMaxUniqueAObjects = 512;
-    const int maxTrackedObjects = std::max(numAObjects, numBObjects);
+    // The point-in-mesh kernel uses one scratch row per B object ray.
+    // Each row tracks up to kAnyhitMaxUniqueAObjects distinct A objects.
+    const int trackedBObjects = numBObjects;
     int* d_anyhit_a_ids = nullptr;
     unsigned int* d_anyhit_a_parity = nullptr;
     unsigned int* d_anyhit_num_unique = nullptr;
-    const size_t slots = static_cast<size_t>(maxTrackedObjects) * static_cast<size_t>(kAnyhitMaxUniqueAObjects);
+    const size_t slots = static_cast<size_t>(trackedBObjects) * static_cast<size_t>(kAnyhitMaxUniqueAObjects);
     CUDA_CHECK(cudaMalloc(&d_anyhit_a_ids, slots * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_anyhit_a_parity, slots * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_num_unique, maxTrackedObjects * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_anyhit_num_unique, trackedBObjects * sizeof(unsigned int)));
 
     // ------------------------------------------------------------------
     // Warmup

@@ -351,8 +351,8 @@ int main(int argc, char* argv[]) {
     
     std::vector<MeshQueryResult> uniqueResults(numUnique);
     if (numUnique > 0) {
-        CUDA_CHECK(cudaMemcpy(uniqueResults.data(), d_merged_results, 
-                              (size_t)numUnique * sizeof(MeshQueryResult), 
+        CUDA_CHECK(cudaMemcpy(uniqueResults.data(), d_merged_results,
+                              static_cast<size_t>(numUnique) * sizeof(MeshQueryResult),
                               cudaMemcpyDeviceToHost));
     }
     

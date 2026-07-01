@@ -12,7 +12,13 @@ long long merge_and_deduplicate_pairs_gpu(
 
 int compact_hash_table_pairs(
     const unsigned long long* d_hash_table, unsigned long long table_size,
-    MeshQueryResult* d_output, int max_output_size
+    MeshQueryResult* d_output, int max_output_size,
+    bool* overflowed_out = nullptr
+);
+
+unsigned long long count_hash_table_pairs(
+    const unsigned long long* d_hash_table,
+    unsigned long long table_size
 );
 
 } // extern "C"

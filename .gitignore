@@ -18,6 +18,8 @@ benchmarks/**/figures/
 benchmarks/latest_figures/
 benchmarks/**/*.json
 benchmarks/**/*.csv
+benchmark_snapshots/
+pierce/scripts/cpp_generator/
 
 # Python and editor state
 __pycache__/

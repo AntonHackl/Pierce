@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <limits>
 #include <unordered_map>
 #include <iomanip>
 #include <cuda_runtime.h>
@@ -140,25 +141,39 @@ QueryResults executeHashQuery(
         }
     }
 
-    // Use estimated pairs to size the output buffer, with a fallback and a safety factor
-    long long safe_estimate = (estimated_pairs > 0) ? (long long)(estimated_pairs * 1.2) : (long long)hash_table_size;
-    // Ensure we don't allocate ridiculously small if estimate is off, utilize triangle count heuristic as floor
-    long long triangle_heuristic = (long long)std::max(mesh1NumEdges, mesh2NumEdges) * 2;
-    
-    long long max_output_long = std::max(safe_estimate, triangle_heuristic);
-    if (max_output_long < 2000000) max_output_long = 2000000;
-    
-    // Clamp to reasonable GPU memory limits if needed, but let's assume we have memory for now or let cudaMalloc fail
-    // (Optional: clamp to hash_table_size as theoretical max unique items)
-    if (max_output_long > hash_table_size) max_output_long = hash_table_size;
-    
-    int max_output = (int)max_output_long;
+    auto t_count_start = std::chrono::high_resolution_clock::now();
+    unsigned long long occupied_slots = count_hash_table_pairs(d_hash_table, hash_table_size);
+    auto t_count_end = std::chrono::high_resolution_clock::now();
+    if (timer) {
+        timer->addMeasurement(
+            "count_hash_table_pairs",
+            std::chrono::duration_cast<std::chrono::microseconds>(t_count_end - t_count_start).count()
+        );
+    }
+
+    if (occupied_slots > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+        occupied_slots = static_cast<unsigned long long>(std::numeric_limits<int>::max());
+    }
+
+    int max_output = static_cast<int>(occupied_slots);
 
     MeshQueryResult* d_merged_results = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_merged_results, max_output * sizeof(MeshQueryResult)));
+    if (max_output > 0) {
+        CUDA_CHECK(cudaMalloc(&d_merged_results, static_cast<size_t>(max_output) * sizeof(MeshQueryResult)));
+    }
 
     auto t_dedup_start = std::chrono::high_resolution_clock::now();
-    int numUnique = compact_hash_table_pairs(d_hash_table, hash_table_size, d_merged_results, max_output);
+    int numUnique = 0;
+    bool outputOverflowed = false;
+    if (max_output > 0) {
+        numUnique = compact_hash_table_pairs(
+            d_hash_table,
+            hash_table_size,
+            d_merged_results,
+            max_output,
+            &outputOverflowed
+        );
+    }
     auto t_dedup_end = std::chrono::high_resolution_clock::now();
     if (timer) {
         timer->addMeasurement(
@@ -178,7 +193,7 @@ QueryResults executeHashQuery(
     
     if (verbose) {
          std::cout << "Hash Table Query found " << numUnique << " unique pairs." << std::endl;
-         if (numUnique >= max_output) {
+         if (outputOverflowed) {
              std::cerr << "WARNING: Output buffer full! Results may be truncated. Max output: " << max_output << std::endl;
          }
     }
