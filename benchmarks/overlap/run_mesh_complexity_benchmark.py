@@ -68,6 +68,7 @@ def run_experiment(
     tdbase_threads=None,
     tdbase_compute_threads=1,
     approaches=None,
+    track_hash_contention=False,
     timeout=3600.0,
     tdbase_timing_mode=TDBASE_TIMING_MODE_INDEX_COMPUTE_EVALUATE,
 ):
@@ -86,7 +87,8 @@ def run_experiment(
     )
     direct_estimation_adapter = PierceAdapter(
         str(PIERCE_DIR), mode="direct_estimation", preprocessed_dir=str(PREPROCESSED_DIR), 
-        timings_dir=str(shared_dirs["timings"]), grid_cell_size=grid_cell_size, warmup_runs=1
+        timings_dir=str(shared_dirs["timings"]), grid_cell_size=grid_cell_size, warmup_runs=1,
+        track_hash_contention=track_hash_contention,
     )
     exact_adapter.preprocessed_dir = shared_dirs["preprocessed"]
     direct_estimation_adapter.preprocessed_dir = shared_dirs["preprocessed"]
@@ -305,6 +307,7 @@ def main():
                         choices=["exact", "direct_estimation", "cgal", "touch", "tdbase"], help="Approaches to run")
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout in seconds per run")
     parser.add_argument("--threads", type=int, default=None, help="Number of threads for CGAL/TOUCH")
+    parser.add_argument("--track-hash-contention", action="store_true", help="Enable overlap hash contention tracking for Pierce direct estimation")
     parser.add_argument("--tdbase-threads", type=int, default=None, help="Number of TDBase join threads")
     parser.add_argument("--tdbase-compute-threads", type=int, default=1, help="Number of TDBase compute threads per tile")
     parser.add_argument("--revisualize", type=str, help="Path to results.json to re-generate plots from")
@@ -340,6 +343,7 @@ def main():
         tdbase_threads=args.tdbase_threads,
         tdbase_compute_threads=args.tdbase_compute_threads,
         approaches=args.approaches,
+        track_hash_contention=args.track_hash_contention,
         timeout=args.timeout,
         tdbase_timing_mode=args.tdbase_timing_mode,
     )
@@ -362,6 +366,7 @@ def main():
                 "num_objects": args.num_objects,
                 "selectivity": args.selectivity,
                 "approaches": args.approaches,
+                "track_hash_contention": args.track_hash_contention,
                 "timeout": args.timeout,
                 "tdbase_timing_mode": args.tdbase_timing_mode,
             },

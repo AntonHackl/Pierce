@@ -9,6 +9,7 @@ build/
 
 # Benchmark data and generated results
 data/
+memories/
 microns_data/
 benchmarks/data/
 benchmarks/slurm_logs/

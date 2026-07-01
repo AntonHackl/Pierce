@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--intersection-query-direction", type=str, default="both", choices=["both", "mesh1_to_mesh2", "mesh2_to_mesh1"])
     parser.add_argument("--overlap-max-iterations", type=float, default=100.0)
     parser.add_argument("--hash-load-factor", type=float, default=0.5)
+    parser.add_argument("--track-overflow", action="store_true")
     parser.add_argument("--enable-profiling-stats", action="store_true")
     parser.add_argument("--include-overlap-pairs", action="store_true")
     args = parser.parse_args()
@@ -109,6 +110,7 @@ def main():
     intersection_extra_args = build_intersection_extra_args(
         overlap_max_iterations=args.overlap_max_iterations,
         hash_load_factor=args.hash_load_factor,
+        track_overflow=args.track_overflow,
         enable_profiling_stats=args.enable_profiling_stats,
         intersection_query_direction=args.intersection_query_direction,
     )
@@ -202,6 +204,7 @@ def main():
                 "overlap_query_direction": args.overlap_query_direction,
                 "overlap_max_iterations": args.overlap_max_iterations,
                 "hash_load_factor": args.hash_load_factor,
+                "track_overflow": args.track_overflow,
                 "enable_profiling_stats": args.enable_profiling_stats,
                 "include_overlap_pairs": args.include_overlap_pairs,
                 "shared_data_root": str(shared_dirs["root"]),

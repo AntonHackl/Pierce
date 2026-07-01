@@ -198,6 +198,7 @@ def build_intersection_extra_args(
     overlap_max_iterations: int,
     hash_load_factor: float,
     enable_profiling_stats: bool,
+    track_overflow: bool,
     intersection_query_direction: str,
 ) -> list[str]:
     args = [
@@ -210,6 +211,8 @@ def build_intersection_extra_args(
     ]
     if enable_profiling_stats:
         args.append("--enable-profiling-stats")
+    if track_overflow:
+        args.append("--track-overflow")
     return args
 
 

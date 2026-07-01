@@ -216,6 +216,8 @@ extern "C" __global__ void __anyhit__ah() {
         containment_params.anyhit_a_ids[idx] = a_obj;
         containment_params.anyhit_a_parity[idx] = 1U;
         containment_params.anyhit_num_unique[b_obj] = count + 1U;
+    } else if (containment_params.anyhit_overflow_events != nullptr) {
+        containment_params.anyhit_overflow_events[b_obj] += 1U;
     }
 
     optixIgnoreIntersection();
@@ -245,6 +247,9 @@ extern "C" __global__ void __raygen__point_in_mesh() {
 
     const int base = b_obj * maxUnique;
     containment_params.anyhit_num_unique[b_obj] = 0U;
+    if (containment_params.anyhit_overflow_events != nullptr) {
+        containment_params.anyhit_overflow_events[b_obj] = 0U;
+    }
     for (int i = 0; i < maxUnique; ++i) {
         containment_params.anyhit_a_ids[base + i] = -1;
         containment_params.anyhit_a_parity[base + i] = 0U;

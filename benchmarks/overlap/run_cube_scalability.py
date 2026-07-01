@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarks.common.scenario_utils import create_benchmark_run_layout, write_json
 from benchmarks.common.viz_utils import apply_paper_style, make_legend_bold, PAPER_FIGSIZE, set_log_timing_axis_limits, style_for
 from benchmarks.common.scenario_utils import (
+    CUBE_SCALABILITY_COUNTS,
     canonical_cube_pair_paths,
     ensure_cube_pair_dataset,
     get_shared_data_dirs,
@@ -42,11 +43,11 @@ RUNS_DIR = SCRIPT_DIR / "runs"
 TIMEOUT_SECONDS = 120.0
 
 # Cube Counts for Dataset B (Dataset A is fixed at 200k)
-CUBE_COUNTS = [200000, 400000, 600000, 1000000]
+CUBE_COUNTS = CUBE_SCALABILITY_COUNTS
 FIXED_COUNT = "200k_a"
 SHARED_SCENARIO = "cube_scalability"
 
-def run_experiment(runs, grid_cell_size, run_log_dir, threads=None, approaches=None, timeout=120.0):
+def run_experiment(runs, grid_cell_size, run_log_dir, threads=None, approaches=None, timeout=120.0, track_hash_contention=False):
     if approaches is None:
         approaches = ["exact", "estimated", "cgal", "touch"]
     print("--- Starting Cube Scalability Experiment ---")
@@ -74,7 +75,8 @@ def run_experiment(runs, grid_cell_size, run_log_dir, threads=None, approaches=N
         preprocessed_dir=str(shared_dirs["preprocessed"]), 
         timings_dir=str(shared_dirs["timings"]),
         grid_cell_size=grid_cell_size,
-        warmup_runs=1
+        warmup_runs=1,
+        track_hash_contention=track_hash_contention,
     )
 
     cgal_adapter = CGALAdapter(
@@ -389,6 +391,7 @@ def main():
     parser.add_argument("--grid-cell-size", type=float, default=5.0, help="Grid cell size for RaySpace")
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout in seconds per run")
     parser.add_argument("--threads", type=int, default=None, help="Number of threads for CGAL/TOUCH")
+    parser.add_argument("--track-hash-contention", action="store_true", help="Enable overlap hash contention tracking for Pierce direct estimation")
     parser.add_argument("--approaches", type=str, nargs="+", default=["exact", "estimated", "cgal", "touch"], 
                         choices=["exact", "estimated", "cgal", "touch"], help="Approaches to run")
     args = parser.parse_args()
@@ -396,7 +399,15 @@ def main():
     run_layout = create_benchmark_run_layout(SCRIPT_DIR, "overlap_cube_scalability")
     run_log_dir = Path(run_layout["logs_dir"])
     figures_dir = Path(run_layout["figures_dir"])
-    results = run_experiment(args.runs, args.grid_cell_size, run_log_dir, threads=args.threads, approaches=args.approaches, timeout=args.timeout)
+    results = run_experiment(
+        args.runs,
+        args.grid_cell_size,
+        run_log_dir,
+        threads=args.threads,
+        approaches=args.approaches,
+        timeout=args.timeout,
+        track_hash_contention=args.track_hash_contention,
+    )
     
     if results and results["counts"]:
         print("\nResults Summary:")
@@ -432,6 +443,7 @@ def main():
                     "runs": args.runs,
                     "grid_cell_size": args.grid_cell_size,
                     "timeout": args.timeout,
+                    "track_hash_contention": args.track_hash_contention,
                 },
                 "results": clean_results,
             },

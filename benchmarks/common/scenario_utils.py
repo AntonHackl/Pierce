@@ -15,6 +15,7 @@ PIERCE_DIR = REPO_ROOT / "pierce"
 SHARED_DATA_ROOT = REPO_ROOT / "data"
 GENERATE_CUBES_SCRIPT = PIERCE_DIR / "scripts" / "generate_cubes_by_selectivity.py"
 GENERATE_SPHERES_BIN = PIERCE_DIR / "scripts" / "cpp_generator" / "generate_spheres"
+CUBE_SCALABILITY_COUNTS = [200000, 400000, 600000, 1000000]
 
 
 def build_selectivity_sweep(

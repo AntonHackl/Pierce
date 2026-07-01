@@ -39,6 +39,7 @@ struct MeshContainmentLaunchParams {
     int* anyhit_a_ids;
     unsigned int* anyhit_a_parity;
     unsigned int* anyhit_num_unique;
+    unsigned int* anyhit_overflow_events;
 
     // Iteration limit for edge overlap scans.
     int overlap_max_iterations;

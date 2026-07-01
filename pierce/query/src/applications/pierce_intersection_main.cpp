@@ -59,6 +59,36 @@ QueryDirection parseQueryDirection(const std::string& direction) {
     throw std::invalid_argument("Invalid query direction: " + direction);
 }
 
+static constexpr int kIntersectionAnyhitLegacyDefaultMaxTargetsPerSource = 256;
+static constexpr int kIntersectionAnyhitHardMaxTargetsPerSource = 256;
+
+struct IntersectionAnyhitUsageSummary {
+    unsigned int maxCandidateCount = 0;
+    unsigned long long overflowEvents = 0;
+    unsigned int overflowSources = 0;
+};
+
+static IntersectionAnyhitUsageSummary summarizeIntersectionAnyhitUsage(
+    const std::vector<unsigned int>& mesh1CandidateCounts,
+    const std::vector<unsigned int>& mesh1OverflowEvents,
+    const std::vector<unsigned int>& mesh2CandidateCounts,
+    const std::vector<unsigned int>& mesh2OverflowEvents
+) {
+    IntersectionAnyhitUsageSummary summary;
+    auto accumulateDirection = [&](const std::vector<unsigned int>& counts, const std::vector<unsigned int>& overflows) {
+        for (size_t i = 0; i < counts.size(); ++i) {
+            summary.maxCandidateCount = std::max(summary.maxCandidateCount, counts[i]);
+            summary.overflowEvents += overflows[i];
+            if (overflows[i] > 0) {
+                summary.overflowSources++;
+            }
+        }
+    };
+    accumulateDirection(mesh1CandidateCounts, mesh1OverflowEvents);
+    accumulateDirection(mesh2CandidateCounts, mesh2OverflowEvents);
+    return summary;
+}
+
 void writeIntersectionPairsCsv(
     const std::string& outputPath,
     const std::vector<MeshQueryResult>& pairs
@@ -328,19 +358,20 @@ static int chooseIntersectionHashTableSize(long long estimatedPairs, float hashL
 
 class IntersectionEstimatedCliOptions : public BenchmarkMeshPairCliOptions {
 public:
-    IntersectionEstimatedCliOptions() : BenchmarkMeshPairCliOptions("estimated_intersection_timing.json") {}
+    IntersectionEstimatedCliOptions() : BenchmarkMeshPairCliOptions("estimated_intersection_timing.json") {
+        allowNoExportFlag = true;
+    }
 
     std::string queryDirectionArg = "both";
     bool estimateOnly = false;
-    bool enableTracking = false;
+    bool trackOverflow = false;
     bool enableProfilingStats = false;
     std::string pairsOutputPath;
-    std::string pairHitsOutputPath;
-    std::string containmentTrackingOutputPath;
     float gamma = 0.8f;
     float epsilon = 0.001f;
     float hashLoadFactor = 0.5f;
     int overlapMaxIterations = 100;
+    int anyhitMaxTargetsPerSource = -1;
 
     void printHelp(const char* exeName) const {
         std::vector<HelpEntry> options;
@@ -351,12 +382,12 @@ public:
         options.emplace_back("--estimate-only", "Run only selectivity estimation");
         options.emplace_back("--query-direction <both|mesh1_to_mesh2|mesh2_to_mesh1>", "Control query direction (default: both)");
         options.emplace_back("--overlap-max-iterations <int>", "Overlap ray iteration cap (default: 100)");
+        options.emplace_back("--containment-anyhit-max-targets <int>", "Containment any-hit scratch cap per source object (default: 256)");
         options.emplace_back("--hash-load-factor <float>", "Hash load factor in (0,1] (default: 0.5)");
-        options.emplace_back("--enable-tracking", "Enable optional containment candidate tracking and CSV exports");
+        options.emplace_back("--track-overflow", "Enable containment any-hit overflow summary diagnostics");
         options.emplace_back("--enable-profiling-stats", "Enable device-side profiling counters");
         options.emplace_back("--pairs-output <path>", "Intersection pairs CSV path (default: intersection_pairs.csv)");
-        options.emplace_back("--pair-hits-output <path>", "Pair hit tracking CSV path (default: intersection_pair_hits.csv)");
-        options.emplace_back("--containment-tracking-output <path>", "Containment tracking CSV path (default: intersection_containment_tracking.csv)");
+        appendNoExportHelp(options);
         appendHelpFlag(options);
 
         printHelpMessage(
@@ -389,12 +420,16 @@ protected:
             overlapMaxIterations = std::stoi(argv[++i]);
             return true;
         }
+        if (arg == "--containment-anyhit-max-targets" && i + 1 < argc) {
+            anyhitMaxTargetsPerSource = std::stoi(argv[++i]);
+            return true;
+        }
         if (arg == "--hash-load-factor" && i + 1 < argc) {
             hashLoadFactor = std::stof(argv[++i]);
             return true;
         }
-        if (arg == "--enable-tracking") {
-            enableTracking = true;
+        if (arg == "--track-overflow") {
+            trackOverflow = true;
             return true;
         }
         if (arg == "--enable-profiling-stats") {
@@ -403,14 +438,6 @@ protected:
         }
         if (arg == "--pairs-output" && i + 1 < argc) {
             pairsOutputPath = argv[++i];
-            return true;
-        }
-        if (arg == "--pair-hits-output" && i + 1 < argc) {
-            pairHitsOutputPath = argv[++i];
-            return true;
-        }
-        if (arg == "--containment-tracking-output" && i + 1 < argc) {
-            containmentTrackingOutputPath = argv[++i];
             return true;
         }
         return false;
@@ -554,22 +581,21 @@ int main(int argc, char* argv[]) {
     const std::string& outputJsonPath = options.outputJsonPath;
     const std::string& queryDirectionArg = options.queryDirectionArg;
     const bool estimateOnly = options.estimateOnly;
-    const bool enableTracking = options.enableTracking;
+    const bool trackOverflow = options.trackOverflow;
     const bool enableProfilingStats = options.enableProfilingStats;
+    const bool exportResults = options.exportResults;
     const std::string pairsOutputPath = options.pairsOutputPath.empty()
         ? "intersection_pairs.csv"
         : options.pairsOutputPath;
-    const std::string pairHitsOutputPath = options.pairHitsOutputPath.empty()
-        ? "intersection_pair_hits.csv"
-        : options.pairHitsOutputPath;
-    const std::string containmentTrackingOutputPath = options.containmentTrackingOutputPath.empty()
-        ? "intersection_containment_tracking.csv"
-        : options.containmentTrackingOutputPath;
     const float gamma = options.gamma;
     const float epsilon = options.epsilon;
     const float hashLoadFactor = options.hashLoadFactor;
     const int overlapMaxIterations = options.overlapMaxIterations;
     const int warmupRuns = options.warmupRuns;
+    const bool anyhitCapExplicitlyConfigured = options.anyhitMaxTargetsPerSource > 0;
+    int anyhitMaxTargetsPerSource = anyhitCapExplicitlyConfigured
+        ? options.anyhitMaxTargetsPerSource
+        : kIntersectionAnyhitLegacyDefaultMaxTargetsPerSource;
 
     QueryDirection queryDirection = QueryDirection::Both;
     try {
@@ -586,6 +612,12 @@ int main(int argc, char* argv[]) {
     }
     if (overlapMaxIterations <= 0) {
         std::cerr << "--overlap-max-iterations must be > 0." << std::endl;
+        return 1;
+    }
+    if (anyhitMaxTargetsPerSource <= 0 ||
+        anyhitMaxTargetsPerSource > kIntersectionAnyhitHardMaxTargetsPerSource) {
+        std::cerr << "--containment-anyhit-max-targets must be in [1, "
+                  << kIntersectionAnyhitHardMaxTargetsPerSource << "]." << std::endl;
         return 1;
     }
     
@@ -633,7 +665,10 @@ int main(int argc, char* argv[]) {
         std::cout << "Hash Table Size:    " << hash_table_size << " (Load Factor ~" << hashLoadFactor << ")" << std::endl;
         std::cout << "Query Direction:    " << queryDirectionArg << std::endl;
         std::cout << "Overlap Max Iter:   " << overlapMaxIterations << std::endl;
-        std::cout << "Tracking:           " << (enableTracking ? "enabled" : "disabled") << std::endl;
+        std::cout << "Containment AnyHit: " << anyhitMaxTargetsPerSource
+                  << " per source (" << (anyhitCapExplicitlyConfigured ? "explicit" : "default") << ")" << std::endl;
+        std::cout << "Overflow Tracking:  " << (trackOverflow ? "enabled" : "disabled") << std::endl;
+        std::cout << "Export Results:     " << (exportResults ? "enabled" : "disabled") << std::endl;
         std::cout << "Profiling Stats:    " << (enableProfilingStats ? "enabled" : "disabled") << std::endl;
         std::cout << "===========================\n" << std::endl;
         timer.finish(outputJsonPath);
@@ -647,7 +682,10 @@ int main(int argc, char* argv[]) {
     std::cout << "Hash Table Size:    " << hash_table_size << " (Load Factor ~" << hashLoadFactor << ")" << std::endl;
     std::cout << "Query Direction:    " << queryDirectionArg << std::endl;
     std::cout << "Overlap Max Iter:   " << overlapMaxIterations << std::endl;
-    std::cout << "Tracking:           " << (enableTracking ? "enabled" : "disabled") << std::endl;
+    std::cout << "Containment AnyHit: " << anyhitMaxTargetsPerSource
+              << " per source (" << (anyhitCapExplicitlyConfigured ? "explicit" : "default") << ")" << std::endl;
+    std::cout << "Overflow Tracking:  " << (trackOverflow ? "enabled" : "disabled") << std::endl;
+    std::cout << "Export Results:     " << (exportResults ? "enabled" : "disabled") << std::endl;
     std::cout << "Profiling Stats:    " << (enableProfilingStats ? "enabled" : "disabled") << std::endl;
     std::cout << "===========================\n" << std::endl;
 
@@ -721,7 +759,6 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMemcpy(d_first_triangle_mesh1, firstTriangleMesh1.data(), mesh1NumObjects * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_first_triangle_mesh2, firstTriangleMesh2.data(), mesh2NumObjects * sizeof(int), cudaMemcpyHostToDevice));
 
-    constexpr int kAnyhitMaxTargetsPerSource = 256;
     int* d_anyhit_candidate_object_ids_mesh1 = nullptr;
     unsigned int* d_anyhit_candidate_parity_mesh1 = nullptr;
     unsigned int* d_anyhit_candidate_hit_counts_mesh1 = nullptr;
@@ -732,19 +769,6 @@ int main(int argc, char* argv[]) {
     unsigned int* d_anyhit_candidate_hit_counts_mesh2 = nullptr;
     unsigned int* d_anyhit_candidate_count_mesh2 = nullptr;
     unsigned int* d_anyhit_candidate_overflow_mesh2 = nullptr;
-
-    const size_t anyhitSlotsMesh1 = static_cast<size_t>(mesh1NumObjects) * static_cast<size_t>(kAnyhitMaxTargetsPerSource);
-    const size_t anyhitSlotsMesh2 = static_cast<size_t>(mesh2NumObjects) * static_cast<size_t>(kAnyhitMaxTargetsPerSource);
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_object_ids_mesh1, anyhitSlotsMesh1 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_parity_mesh1, anyhitSlotsMesh1 * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_hit_counts_mesh1, anyhitSlotsMesh1 * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_count_mesh1, mesh1NumObjects * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_overflow_mesh1, mesh1NumObjects * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_object_ids_mesh2, anyhitSlotsMesh2 * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_parity_mesh2, anyhitSlotsMesh2 * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_hit_counts_mesh2, anyhitSlotsMesh2 * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_count_mesh2, mesh2NumObjects * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_overflow_mesh2, mesh2NumObjects * sizeof(unsigned int)));
 
     MeshIntersectionLaunchParams params1{};
     params1.mesh1_vertices = mesh1Uploader.getVertices();
@@ -792,7 +816,7 @@ int main(int argc, char* argv[]) {
     params1.overlap_max_iterations = overlapMaxIterations;
     params1.profiling_enabled = enableProfilingStats ? 1 : 0;
     params1.profiling_stats = d_profiling_stats;
-    params1.anyhit_max_pair_targets_per_source = kAnyhitMaxTargetsPerSource;
+    params1.anyhit_max_pair_targets_per_source = anyhitMaxTargetsPerSource;
     params1.anyhit_candidate_object_ids = d_anyhit_candidate_object_ids_mesh1;
     params1.anyhit_candidate_parity = d_anyhit_candidate_parity_mesh1;
     params1.anyhit_candidate_hit_counts = d_anyhit_candidate_hit_counts_mesh1;
@@ -802,21 +826,64 @@ int main(int argc, char* argv[]) {
     params2.overlap_max_iterations = overlapMaxIterations;
     params2.profiling_enabled = enableProfilingStats ? 1 : 0;
     params2.profiling_stats = d_profiling_stats;
-    params2.anyhit_max_pair_targets_per_source = kAnyhitMaxTargetsPerSource;
+    params2.anyhit_max_pair_targets_per_source = anyhitMaxTargetsPerSource;
     params2.anyhit_candidate_object_ids = d_anyhit_candidate_object_ids_mesh2;
     params2.anyhit_candidate_parity = d_anyhit_candidate_parity_mesh2;
     params2.anyhit_candidate_hit_counts = d_anyhit_candidate_hit_counts_mesh2;
     params2.anyhit_candidate_count_per_source = d_anyhit_candidate_count_mesh2;
     params2.anyhit_candidate_overflow_per_source = d_anyhit_candidate_overflow_mesh2;
 
-    PairHitTrackingBuffers pairHitBuffers;
-    ContainmentTrackingBuffers containmentTrackingBuffers;
-    if (enableTracking) {
-        pairHitBuffers.allocate(mesh1NumObjects, mesh2NumObjects);
-        pairHitBuffers.setupLaunchParams(params1, params2);
-        containmentTrackingBuffers.allocate(mesh1NumObjects, mesh2NumObjects);
-        containmentTrackingBuffers.setupLaunchParams(params1, params2);
-    } else {
+    auto freeAnyhitBuffers = [&]() {
+        if (d_anyhit_candidate_object_ids_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_object_ids_mesh1));
+        if (d_anyhit_candidate_parity_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_parity_mesh1));
+        if (d_anyhit_candidate_hit_counts_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_hit_counts_mesh1));
+        if (d_anyhit_candidate_count_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_count_mesh1));
+        if (d_anyhit_candidate_overflow_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_overflow_mesh1));
+        if (d_anyhit_candidate_object_ids_mesh2) CUDA_CHECK(cudaFree(d_anyhit_candidate_object_ids_mesh2));
+        if (d_anyhit_candidate_parity_mesh2) CUDA_CHECK(cudaFree(d_anyhit_candidate_parity_mesh2));
+        if (d_anyhit_candidate_hit_counts_mesh2) CUDA_CHECK(cudaFree(d_anyhit_candidate_hit_counts_mesh2));
+        if (d_anyhit_candidate_count_mesh2) CUDA_CHECK(cudaFree(d_anyhit_candidate_count_mesh2));
+        if (d_anyhit_candidate_overflow_mesh2) CUDA_CHECK(cudaFree(d_anyhit_candidate_overflow_mesh2));
+        d_anyhit_candidate_object_ids_mesh1 = nullptr;
+        d_anyhit_candidate_parity_mesh1 = nullptr;
+        d_anyhit_candidate_hit_counts_mesh1 = nullptr;
+        d_anyhit_candidate_count_mesh1 = nullptr;
+        d_anyhit_candidate_overflow_mesh1 = nullptr;
+        d_anyhit_candidate_object_ids_mesh2 = nullptr;
+        d_anyhit_candidate_parity_mesh2 = nullptr;
+        d_anyhit_candidate_hit_counts_mesh2 = nullptr;
+        d_anyhit_candidate_count_mesh2 = nullptr;
+        d_anyhit_candidate_overflow_mesh2 = nullptr;
+    };
+    auto configureAnyhitBuffers = [&](int cap) {
+        freeAnyhitBuffers();
+        const size_t anyhitSlotsMesh1 = static_cast<size_t>(mesh1NumObjects) * static_cast<size_t>(cap);
+        const size_t anyhitSlotsMesh2 = static_cast<size_t>(mesh2NumObjects) * static_cast<size_t>(cap);
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_object_ids_mesh1, anyhitSlotsMesh1 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_parity_mesh1, anyhitSlotsMesh1 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_hit_counts_mesh1, anyhitSlotsMesh1 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_count_mesh1, mesh1NumObjects * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_overflow_mesh1, mesh1NumObjects * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_object_ids_mesh2, anyhitSlotsMesh2 * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_parity_mesh2, anyhitSlotsMesh2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_hit_counts_mesh2, anyhitSlotsMesh2 * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_count_mesh2, mesh2NumObjects * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_overflow_mesh2, mesh2NumObjects * sizeof(unsigned int)));
+
+        params1.anyhit_max_pair_targets_per_source = cap;
+        params1.anyhit_candidate_object_ids = d_anyhit_candidate_object_ids_mesh1;
+        params1.anyhit_candidate_parity = d_anyhit_candidate_parity_mesh1;
+        params1.anyhit_candidate_hit_counts = d_anyhit_candidate_hit_counts_mesh1;
+        params1.anyhit_candidate_count_per_source = d_anyhit_candidate_count_mesh1;
+        params1.anyhit_candidate_overflow_per_source = d_anyhit_candidate_overflow_mesh1;
+
+        params2.anyhit_max_pair_targets_per_source = cap;
+        params2.anyhit_candidate_object_ids = d_anyhit_candidate_object_ids_mesh2;
+        params2.anyhit_candidate_parity = d_anyhit_candidate_parity_mesh2;
+        params2.anyhit_candidate_hit_counts = d_anyhit_candidate_hit_counts_mesh2;
+        params2.anyhit_candidate_count_per_source = d_anyhit_candidate_count_mesh2;
+        params2.anyhit_candidate_overflow_per_source = d_anyhit_candidate_overflow_mesh2;
+
         params1.enable_pair_hit_tracking = 0;
         params1.max_pair_targets_per_source = 0;
         params1.pair_target_object_ids = nullptr;
@@ -825,16 +892,56 @@ int main(int argc, char* argv[]) {
         params2.max_pair_targets_per_source = 0;
         params2.pair_target_object_ids = nullptr;
         params2.pair_target_hit_counts = nullptr;
+    };
 
-        params1.enable_containment_tracking = 0;
-        params1.containment_iterations_per_source = nullptr;
-        params1.containment_candidate_count_per_source = nullptr;
-        params1.containment_candidate_overflow_per_source = nullptr;
-        params2.enable_containment_tracking = 0;
-        params2.containment_iterations_per_source = nullptr;
-        params2.containment_candidate_count_per_source = nullptr;
-        params2.containment_candidate_overflow_per_source = nullptr;
-    }
+    params1.enable_containment_tracking = 0;
+    params1.containment_iterations_per_source = nullptr;
+    params1.containment_candidate_count_per_source = nullptr;
+    params1.containment_candidate_overflow_per_source = nullptr;
+    params2.enable_containment_tracking = 0;
+    params2.containment_iterations_per_source = nullptr;
+    params2.containment_candidate_count_per_source = nullptr;
+    params2.containment_candidate_overflow_per_source = nullptr;
+    configureAnyhitBuffers(anyhitMaxTargetsPerSource);
+
+    auto copyIntersectionAnyhitDiagnostics = [&]() {
+        std::vector<unsigned int> mesh1CandidateCounts(mesh1NumObjects, 0);
+        std::vector<unsigned int> mesh1OverflowEvents(mesh1NumObjects, 0);
+        std::vector<unsigned int> mesh2CandidateCounts(mesh2NumObjects, 0);
+        std::vector<unsigned int> mesh2OverflowEvents(mesh2NumObjects, 0);
+
+        CUDA_CHECK(cudaMemcpy(
+            mesh1CandidateCounts.data(),
+            d_anyhit_candidate_count_mesh1,
+            mesh1NumObjects * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            mesh1OverflowEvents.data(),
+            d_anyhit_candidate_overflow_mesh1,
+            mesh1NumObjects * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            mesh2CandidateCounts.data(),
+            d_anyhit_candidate_count_mesh2,
+            mesh2NumObjects * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost
+        ));
+        CUDA_CHECK(cudaMemcpy(
+            mesh2OverflowEvents.data(),
+            d_anyhit_candidate_overflow_mesh2,
+            mesh2NumObjects * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost
+        ));
+
+        return summarizeIntersectionAnyhitUsage(
+            mesh1CandidateCounts,
+            mesh1OverflowEvents,
+            mesh2CandidateCounts,
+            mesh2OverflowEvents
+        );
+    };
 
     timer.next("Warmup");
     if (warmupRuns > 0) {
@@ -867,9 +974,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Actual Intersection Pairs: " << results.numUnique << std::endl;
     timer.addCounter("Profile_Actual_Intersection_Pairs", static_cast<unsigned long long>(results.numUnique));
 
-
-    std::vector<MeshQueryResult> h_pairs(results.numUnique);
-    if (results.numUnique > 0) {
+    std::vector<MeshQueryResult> h_pairs;
+    if (exportResults && results.numUnique > 0) {
+        h_pairs.resize(results.numUnique);
         CUDA_CHECK(cudaMemcpy(
             h_pairs.data(),
             results.d_merged_results,
@@ -878,47 +985,21 @@ int main(int argc, char* argv[]) {
         ));
     }
 
-    writeIntersectionPairsCsv(pairsOutputPath, h_pairs);
-
-    if (enableTracking) {
-        pairHitBuffers.copyFromDevice(mesh1NumObjects, mesh2NumObjects);
-        containmentTrackingBuffers.copyFromDevice(mesh1NumObjects, mesh2NumObjects);
-
-        std::unordered_set<unsigned long long> finalPairs;
-        finalPairs.reserve(h_pairs.size() * 2 + 1);
-        for (const auto& pair : h_pairs) {
-            finalPairs.insert(packIntersectionPairKey(pair.object_id_mesh1, pair.object_id_mesh2));
-        }
-
-        writeIntersectionTrackingCsv(
-            pairHitsOutputPath,
-            PairHitTrackingBuffers::kMaxPairTargetsPerSource,
-            pairHitBuffers.h_mesh1_pair_target_ids,
-            pairHitBuffers.h_mesh1_pair_target_hits,
-            pairHitBuffers.h_mesh2_pair_target_ids,
-            pairHitBuffers.h_mesh2_pair_target_hits,
-            finalPairs
-        );
-        writeIntersectionTrackingSummaryCsv(
-            containmentTrackingOutputPath,
-            PairHitTrackingBuffers::kMaxPairTargetsPerSource,
-            pairHitBuffers.h_mesh1_pair_target_ids,
-            pairHitBuffers.h_mesh1_pair_target_hits,
-            containmentTrackingBuffers.h_mesh1_iterations,
-            containmentTrackingBuffers.h_mesh1_candidate_counts,
-            containmentTrackingBuffers.h_mesh1_candidate_overflows,
-            pairHitBuffers.h_mesh2_pair_target_ids,
-            pairHitBuffers.h_mesh2_pair_target_hits,
-            containmentTrackingBuffers.h_mesh2_iterations,
-            containmentTrackingBuffers.h_mesh2_candidate_counts,
-            containmentTrackingBuffers.h_mesh2_candidate_overflows,
-            finalPairs
-        );
+    if (exportResults) {
+        writeIntersectionPairsCsv(pairsOutputPath, h_pairs);
     }
-    std::cout << "Intersection pairs CSV: " << pairsOutputPath << std::endl;
-    if (enableTracking) {
-        std::cout << "Pair hit tracking CSV: " << pairHitsOutputPath << std::endl;
-        std::cout << "Containment tracking CSV: " << containmentTrackingOutputPath << std::endl;
+
+    if (trackOverflow) {
+        const IntersectionAnyhitUsageSummary anyhitUsageSummary = copyIntersectionAnyhitDiagnostics();
+        std::cout << "Containment any-hit usage: max_candidates=" << anyhitUsageSummary.maxCandidateCount
+                  << ", overflow_events=" << anyhitUsageSummary.overflowEvents
+                  << ", overflow_sources=" << anyhitUsageSummary.overflowSources << std::endl;
+        timer.addCounter("Profile_Containment_Anyhit_Max_Candidates", anyhitUsageSummary.maxCandidateCount);
+        timer.addCounter("Profile_Containment_Anyhit_Overflow_Events", anyhitUsageSummary.overflowEvents);
+        timer.addCounter("Profile_Containment_Anyhit_Overflow_Sources", anyhitUsageSummary.overflowSources);
+    }
+    if (exportResults) {
+        std::cout << "Intersection pairs CSV: " << pairsOutputPath << std::endl;
     }
 
     if (enableProfilingStats) {
@@ -951,18 +1032,7 @@ int main(int argc, char* argv[]) {
     if (d_profiling_stats) {
         CUDA_CHECK(cudaFree(d_profiling_stats));
     }
-    pairHitBuffers.free();
-    containmentTrackingBuffers.free();
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_object_ids_mesh1));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_parity_mesh1));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_hit_counts_mesh1));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_count_mesh1));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_overflow_mesh1));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_object_ids_mesh2));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_parity_mesh2));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_hit_counts_mesh2));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_count_mesh2));
-    CUDA_CHECK(cudaFree(d_anyhit_candidate_overflow_mesh2));
+    freeAnyhitBuffers();
     CUDA_CHECK(cudaFree(d_hash_table));
     CUDA_CHECK(cudaFree(results.d_merged_results));
     CUDA_CHECK(cudaFree(d_first_triangle_mesh1));

@@ -149,6 +149,30 @@ static int chooseContainmentHashTableSize(long long estimatedPairs, float hashLo
     return hashTableSize;
 }
 
+static constexpr int kContainmentAnyhitLegacyDefaultMaxUniqueAObjects = 512;
+static constexpr int kContainmentAnyhitHardMaxUniqueAObjects = 512;
+
+struct ContainmentAnyhitUsageSummary {
+    unsigned int maxUniqueTargets = 0;
+    unsigned long long overflowEvents = 0;
+    unsigned int overflowSources = 0;
+};
+
+static ContainmentAnyhitUsageSummary summarizeContainmentAnyhitUsage(
+    const std::vector<unsigned int>& uniqueCounts,
+    const std::vector<unsigned int>& overflowEvents
+) {
+    ContainmentAnyhitUsageSummary summary;
+    for (size_t i = 0; i < uniqueCounts.size(); ++i) {
+        summary.maxUniqueTargets = std::max(summary.maxUniqueTargets, uniqueCounts[i]);
+        summary.overflowEvents += overflowEvents[i];
+        if (overflowEvents[i] > 0) {
+            summary.overflowSources++;
+        }
+    }
+    return summary;
+}
+
 // ---------------------------------------------------------------------
 // Containment query
 //
@@ -175,7 +199,9 @@ public:
     }
 
     bool includeOverlapPairs = false;
+    bool enableTracking = false;
     int overlapMaxIterations = 256;
+    int anyhitMaxUniqueAObjects = -1;
     float gamma = 0.8f;
     float epsilon = 0.001f;
     float hashLoadFactor = 0.5f;
@@ -190,6 +216,8 @@ public:
         appendBenchmarkRunHelp(options);
         options.emplace_back("--include-overlap-pairs", "Include overlap/touch pairs in output (union of overlap + strict containment)");
         options.emplace_back("--overlap-max-iterations <int>", "Max iterations for edge-scan overlap check (default: 256)");
+        options.emplace_back("--containment-anyhit-max-targets <int>", "Point-in-mesh any-hit scratch cap per B object (default: 512)");
+        options.emplace_back("--track-overflow", "Enable containment any-hit usage/overflow tracking");
         options.emplace_back("--gamma <float>", "Estimation gamma (default: 0.8)");
         options.emplace_back("--epsilon <float>", "Estimation epsilon (default: 0.001)");
         options.emplace_back("--hash-load-factor <float>", "Hash load factor for table sizing (default: 0.5)");
@@ -215,6 +243,14 @@ protected:
         }
         if (arg == "--overlap-max-iterations" && i + 1 < argc) {
             overlapMaxIterations = std::stoi(argv[++i]);
+            return true;
+        }
+        if (arg == "--containment-anyhit-max-targets" && i + 1 < argc) {
+            anyhitMaxUniqueAObjects = std::stoi(argv[++i]);
+            return true;
+        }
+        if (arg == "--track-overflow") {
+            enableTracking = true;
             return true;
         }
         if (arg == "--gamma" && i + 1 < argc) {
@@ -256,13 +292,28 @@ int main(int argc, char* argv[]) {
     const int warmupRuns = options.warmupRuns;
     const bool exportResults = options.exportResults;
     const bool includeOverlapPairs = options.includeOverlapPairs;
+    const bool enableTracking = options.enableTracking;
     const float gamma = options.gamma;
     const float epsilon = options.epsilon;
     const float hashLoadFactor = options.hashLoadFactor;
+    const bool anyhitCapExplicitlyConfigured = options.anyhitMaxUniqueAObjects > 0;
+    int anyhitMaxUniqueAObjects = anyhitCapExplicitlyConfigured
+        ? options.anyhitMaxUniqueAObjects
+        : kContainmentAnyhitLegacyDefaultMaxUniqueAObjects;
+
+    if (anyhitMaxUniqueAObjects <= 0 ||
+        anyhitMaxUniqueAObjects > kContainmentAnyhitHardMaxUniqueAObjects) {
+        std::cerr << "--containment-anyhit-max-targets must be in [1, "
+                  << kContainmentAnyhitHardMaxUniqueAObjects << "]." << std::endl;
+        return 1;
+    }
 
     std::cout << "=== Mesh Containment Query ===" << std::endl;
     std::cout << "(checks which B-objects are fully contained inside A-objects)" << std::endl;
     std::cout << "Point-in-mesh mode: anyhit" << std::endl;
+    std::cout << "AnyHit scratch cap: " << anyhitMaxUniqueAObjects
+              << " (" << (anyhitCapExplicitlyConfigured ? "explicit" : "default") << ")" << std::endl;
+    std::cout << "Overflow Tracking: " << (enableTracking ? "enabled" : "disabled") << std::endl;
     std::cout << "Include overlap pairs: " << (includeOverlapPairs ? "yes" : "no") << std::endl;
 
     if (!options.hasRequiredMeshInputs()) {
@@ -351,17 +402,54 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMemcpy(d_bFirstVertices, bFirstVertices.data(),
                           numBObjects * sizeof(float3), cudaMemcpyHostToDevice));
 
-    constexpr int kAnyhitMaxUniqueAObjects = 512;
     // The point-in-mesh kernel uses one scratch row per B object ray.
-    // Each row tracks up to kAnyhitMaxUniqueAObjects distinct A objects.
+    // Each row tracks up to anyhitMaxUniqueAObjects distinct A objects.
     const int trackedBObjects = numBObjects;
     int* d_anyhit_a_ids = nullptr;
     unsigned int* d_anyhit_a_parity = nullptr;
     unsigned int* d_anyhit_num_unique = nullptr;
-    const size_t slots = static_cast<size_t>(trackedBObjects) * static_cast<size_t>(kAnyhitMaxUniqueAObjects);
-    CUDA_CHECK(cudaMalloc(&d_anyhit_a_ids, slots * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_a_parity, slots * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&d_anyhit_num_unique, trackedBObjects * sizeof(unsigned int)));
+    unsigned int* d_anyhit_overflow_events = nullptr;
+    auto freeAnyhitBuffers = [&]() {
+        if (d_anyhit_overflow_events) CUDA_CHECK(cudaFree(d_anyhit_overflow_events));
+        if (d_anyhit_num_unique) CUDA_CHECK(cudaFree(d_anyhit_num_unique));
+        if (d_anyhit_a_parity) CUDA_CHECK(cudaFree(d_anyhit_a_parity));
+        if (d_anyhit_a_ids) CUDA_CHECK(cudaFree(d_anyhit_a_ids));
+        d_anyhit_overflow_events = nullptr;
+        d_anyhit_num_unique = nullptr;
+        d_anyhit_a_parity = nullptr;
+        d_anyhit_a_ids = nullptr;
+    };
+    auto allocateAnyhitBuffers = [&](int cap) {
+        freeAnyhitBuffers();
+        const size_t slots = static_cast<size_t>(trackedBObjects) * static_cast<size_t>(cap);
+        CUDA_CHECK(cudaMalloc(&d_anyhit_a_ids, slots * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_a_parity, slots * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_anyhit_num_unique, trackedBObjects * sizeof(unsigned int)));
+        if (enableTracking) {
+            CUDA_CHECK(cudaMalloc(&d_anyhit_overflow_events, trackedBObjects * sizeof(unsigned int)));
+        }
+    };
+    allocateAnyhitBuffers(anyhitMaxUniqueAObjects);
+
+    auto copyContainmentAnyhitDiagnostics = [&]() {
+        std::vector<unsigned int> uniqueCounts(trackedBObjects, 0);
+        std::vector<unsigned int> overflowEvents(trackedBObjects, 0);
+        CUDA_CHECK(cudaMemcpy(
+            uniqueCounts.data(),
+            d_anyhit_num_unique,
+            trackedBObjects * sizeof(unsigned int),
+            cudaMemcpyDeviceToHost
+        ));
+        if (enableTracking && d_anyhit_overflow_events) {
+            CUDA_CHECK(cudaMemcpy(
+                overflowEvents.data(),
+                d_anyhit_overflow_events,
+                trackedBObjects * sizeof(unsigned int),
+                cudaMemcpyDeviceToHost
+            ));
+        }
+        return summarizeContainmentAnyhitUsage(uniqueCounts, overflowEvents);
+    };
 
     // ------------------------------------------------------------------
     // Warmup
@@ -433,10 +521,11 @@ int main(int argc, char* argv[]) {
         params.containment_hash_table       = d_containmentHT;
         params.containment_hash_table_size  = containmentHTSize;
         params.trace_phase = 0;
-        params.anyhit_max_unique_a_objects = kAnyhitMaxUniqueAObjects;
+        params.anyhit_max_unique_a_objects = anyhitMaxUniqueAObjects;
         params.anyhit_a_ids = d_anyhit_a_ids;
         params.anyhit_a_parity = d_anyhit_a_parity;
         params.anyhit_num_unique = d_anyhit_num_unique;
+        params.anyhit_overflow_events = d_anyhit_overflow_events;
         params.overlap_max_iterations = options.overlapMaxIterations;
 
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -604,6 +693,15 @@ int main(int argc, char* argv[]) {
         std::cout << "Overlap/Touch pairs (A vs B): " << finalOverlapCount << std::endl;
         std::cout << "Reported pairs: " << numReported << std::endl;
     }
+    if (enableTracking) {
+        const ContainmentAnyhitUsageSummary anyhitUsageSummary = copyContainmentAnyhitDiagnostics();
+        std::cout << "Containment any-hit usage: max_unique_targets=" << anyhitUsageSummary.maxUniqueTargets
+                  << ", overflow_events=" << anyhitUsageSummary.overflowEvents
+                  << ", overflow_sources=" << anyhitUsageSummary.overflowSources << std::endl;
+        timer.addCounter("Profile_Containment_Anyhit_Max_Unique_Targets", anyhitUsageSummary.maxUniqueTargets);
+        timer.addCounter("Profile_Containment_Anyhit_Overflow_Events", anyhitUsageSummary.overflowEvents);
+        timer.addCounter("Profile_Containment_Anyhit_Overflow_Sources", anyhitUsageSummary.overflowSources);
+    }
 
     if (exportResults) {
         std::string csvFile = "mesh_containment_results.csv";
@@ -633,9 +731,7 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaFree(d_intersectionHT));
     CUDA_CHECK(cudaFree(d_containmentHT));
     CUDA_CHECK(cudaFree(d_bFirstVertices));
-    if (d_anyhit_num_unique) CUDA_CHECK(cudaFree(d_anyhit_num_unique));
-    if (d_anyhit_a_parity) CUDA_CHECK(cudaFree(d_anyhit_a_parity));
-    if (d_anyhit_a_ids) CUDA_CHECK(cudaFree(d_anyhit_a_ids));
+    freeAnyhitBuffers();
     PrecomputedEdgeData::freeEdgeData(aEdgeData);
     PrecomputedEdgeData::freeEdgeData(bEdgeData);
 

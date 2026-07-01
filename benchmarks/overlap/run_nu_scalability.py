@@ -768,7 +768,7 @@ def main():
     parser.add_argument("--grid-cell-size", type=float, default=200.0, help="Grid resolution for RaySpace")
     parser.add_argument("--nu", type=int, nargs='+', help="Nu counts to test (e.g. 200 400 600 800)")
     parser.add_argument("--approaches", type=str, nargs='+', choices=["exact", "direct_estimation", "cgal", "touch", "tdbase"], help="Approaches to run")
-    parser.add_argument("--track-hash-contention", action="store_true", help="Enable direct-estimation hash contention tracking")
+    parser.add_argument("--track-hash-contention", action="store_true", help="Enable overlap hash contention tracking for Pierce direct estimation")
     parser.add_argument("--threads", type=int, default=None, help="Number of threads for CGAL/TOUCH")
     parser.add_argument("--tdbase-threads", type=int, default=None, help="Number of TDBase join threads")
     parser.add_argument("--tdbase-compute-threads", type=int, default=1, help="Number of TDBase compute threads per tile")
@@ -876,6 +876,7 @@ def main():
                         "tdbase_compute_threads": args.tdbase_compute_threads,
                         "timeout": args.timeout,
                         "dataset_profile": args.dataset_profile,
+                        "track_hash_contention": args.track_hash_contention,
                         "tdbase_timing_mode": args.tdbase_timing_mode,
                         "isolated_data_root": str(isolated_data_dirs["root"]),
                     },

@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--threads", type=int, default=None, help="Number of threads for CGAL/TOUCH")
     parser.add_argument("--grid-cell-size", type=float, default=700.0)
     parser.add_argument("--overlap-max-iterations", type=int, default=100)
+    parser.add_argument("--track-hash-contention", action="store_true", help="Enable overlap hash contention tracking for Pierce direct estimation")
     parser.add_argument("--query-direction", type=str, default="both", choices=["both", "mesh1tomesh2", "mesh2tomesh1"])
     parser.add_argument("--approaches", type=str, nargs="+", default=["direct_estimation", "cgal", "touch"],
                         help="Approaches to run")
@@ -64,6 +65,7 @@ def main():
         adapters["direct_estimation"] = PierceAdapter(
             str(PIERCE_DIR), mode="direct_estimation", preprocessed_dir=str(dirs["preprocessed"]),
             timings_dir=str(dirs["timings"]), grid_cell_size=args.grid_cell_size, warmup_runs=args.warmup_runs,
+            track_hash_contention=args.track_hash_contention,
         )
     if "cgal" in args.approaches:
         adapters["cgal"] = CGALAdapter(str(CGAL_DIR), preprocessed_dir=str(dirs["preprocessed"]), threads=args.threads, grid_cell_size=args.grid_cell_size)
@@ -145,6 +147,7 @@ def main():
             "timeout_seconds": args.timeout,
             "threads": args.threads,
             "overlap_max_iterations": args.overlap_max_iterations,
+            "track_hash_contention": args.track_hash_contention,
             "query_direction": args.query_direction,
             "approaches": args.approaches,
             "shared_data_root": str(dirs["root"]),

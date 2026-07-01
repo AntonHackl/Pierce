@@ -29,7 +29,8 @@ struct MeshIntersectionLaunchParams;
  * Encapsulates all buffers and setup for pair-hit tracking during containment queries.
  */
 struct PairHitTrackingBuffers {
-    static constexpr int kMaxPairTargetsPerSource = 256;
+    static constexpr int kLegacyDefaultMaxPairTargetsPerSource = 256;
+    int max_pair_targets_per_source = kLegacyDefaultMaxPairTargetsPerSource;
 
     // Device pointers
     int* d_mesh1_pair_target_ids = nullptr;
@@ -48,21 +49,23 @@ struct PairHitTrackingBuffers {
      * @param mesh1NumObjects Number of objects in mesh1
      * @param mesh2NumObjects Number of objects in mesh2
      */
-    void allocate(int mesh1NumObjects, int mesh2NumObjects) {
-        CUDA_CHECK(cudaMalloc(&d_mesh1_pair_target_ids, mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_mesh1_pair_target_hits, mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMalloc(&d_mesh2_pair_target_ids, mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_mesh2_pair_target_hits, mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int)));
+    void allocate(int mesh1NumObjects, int mesh2NumObjects, int maxTargetsPerSource) {
+        max_pair_targets_per_source = maxTargetsPerSource;
 
-        CUDA_CHECK(cudaMemset(d_mesh1_pair_target_ids, 0xFF, mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_mesh1_pair_target_hits, 0, mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(d_mesh2_pair_target_ids, 0xFF, mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_mesh2_pair_target_hits, 0, mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_mesh1_pair_target_ids, mesh1NumObjects * max_pair_targets_per_source * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_mesh1_pair_target_hits, mesh1NumObjects * max_pair_targets_per_source * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&d_mesh2_pair_target_ids, mesh2NumObjects * max_pair_targets_per_source * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_mesh2_pair_target_hits, mesh2NumObjects * max_pair_targets_per_source * sizeof(unsigned int)));
 
-        h_mesh1_pair_target_ids.resize(mesh1NumObjects * kMaxPairTargetsPerSource, -1);
-        h_mesh1_pair_target_hits.resize(mesh1NumObjects * kMaxPairTargetsPerSource, 0);
-        h_mesh2_pair_target_ids.resize(mesh2NumObjects * kMaxPairTargetsPerSource, -1);
-        h_mesh2_pair_target_hits.resize(mesh2NumObjects * kMaxPairTargetsPerSource, 0);
+        CUDA_CHECK(cudaMemset(d_mesh1_pair_target_ids, 0xFF, mesh1NumObjects * max_pair_targets_per_source * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_mesh1_pair_target_hits, 0, mesh1NumObjects * max_pair_targets_per_source * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(d_mesh2_pair_target_ids, 0xFF, mesh2NumObjects * max_pair_targets_per_source * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_mesh2_pair_target_hits, 0, mesh2NumObjects * max_pair_targets_per_source * sizeof(unsigned int)));
+
+        h_mesh1_pair_target_ids.resize(mesh1NumObjects * max_pair_targets_per_source, -1);
+        h_mesh1_pair_target_hits.resize(mesh1NumObjects * max_pair_targets_per_source, 0);
+        h_mesh2_pair_target_ids.resize(mesh2NumObjects * max_pair_targets_per_source, -1);
+        h_mesh2_pair_target_hits.resize(mesh2NumObjects * max_pair_targets_per_source, 0);
     }
 
     /**
@@ -72,12 +75,12 @@ struct PairHitTrackingBuffers {
      */
     void setupLaunchParams(MeshIntersectionLaunchParams& params1, MeshIntersectionLaunchParams& params2) {
         params1.enable_pair_hit_tracking = 1;
-        params1.max_pair_targets_per_source = kMaxPairTargetsPerSource;
+        params1.max_pair_targets_per_source = max_pair_targets_per_source;
         params1.pair_target_object_ids = d_mesh1_pair_target_ids;
         params1.pair_target_hit_counts = d_mesh1_pair_target_hits;
 
         params2.enable_pair_hit_tracking = 1;
-        params2.max_pair_targets_per_source = kMaxPairTargetsPerSource;
+        params2.max_pair_targets_per_source = max_pair_targets_per_source;
         params2.pair_target_object_ids = d_mesh2_pair_target_ids;
         params2.pair_target_hit_counts = d_mesh2_pair_target_hits;
     }
@@ -89,13 +92,13 @@ struct PairHitTrackingBuffers {
      */
     void copyFromDevice(int mesh1NumObjects, int mesh2NumObjects) {
         CUDA_CHECK(cudaMemcpy(h_mesh1_pair_target_ids.data(), d_mesh1_pair_target_ids, 
-                              mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(int), cudaMemcpyDeviceToHost));
+                              mesh1NumObjects * max_pair_targets_per_source * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_mesh1_pair_target_hits.data(), d_mesh1_pair_target_hits, 
-                              mesh1NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+                              mesh1NumObjects * max_pair_targets_per_source * sizeof(unsigned int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_mesh2_pair_target_ids.data(), d_mesh2_pair_target_ids, 
-                              mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(int), cudaMemcpyDeviceToHost));
+                              mesh2NumObjects * max_pair_targets_per_source * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(h_mesh2_pair_target_hits.data(), d_mesh2_pair_target_hits, 
-                              mesh2NumObjects * kMaxPairTargetsPerSource * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+                              mesh2NumObjects * max_pair_targets_per_source * sizeof(unsigned int), cudaMemcpyDeviceToHost));
     }
 
     /**
