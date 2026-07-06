@@ -100,6 +100,9 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         num_intersections = 0
         universe_extents1 = [0.0, 0.0, 0.0]
         universe_extents2 = [0.0, 0.0, 0.0]
+        gpu_memory_peak_used_bytes = 0
+        gpu_memory_peak_free_bytes = 0
+        gpu_memory_total_bytes = 0
 
         print(f"[{self.name}] Running benchmark...")
 
@@ -197,10 +200,14 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
                     data = json.load(f)
 
                 phases = data.get("phases", {})
+                counters = data.get("counters", {})
                 phase_values = {}
                 for key, phase_data in phases.items():
                     normalized_key = re.sub(r"_\d+$", "", key.lower())
                     phase_values[normalized_key] = phase_values.get(normalized_key, 0.0) + phase_data.get("duration_ms", 0.0)
+                gpu_memory_peak_used_bytes = int(counters.get("gpu_memory_peak_used_bytes", gpu_memory_peak_used_bytes))
+                gpu_memory_peak_free_bytes = int(counters.get("gpu_memory_peak_free_bytes", gpu_memory_peak_free_bytes))
+                gpu_memory_total_bytes = int(counters.get("gpu_memory_total_bytes", gpu_memory_total_bytes))
 
                 has_detailed_raytrace = any(k.startswith("raytrace_") for k in phase_values.keys())
 
@@ -267,5 +274,8 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
             "num_obj2": num_obj2,
             "num_intersections": num_intersections,
             "universe_extents1": universe_extents1,
-            "universe_extents2": universe_extents2
+            "universe_extents2": universe_extents2,
+            "gpu_memory_peak_used_bytes": gpu_memory_peak_used_bytes,
+            "gpu_memory_peak_free_bytes": gpu_memory_peak_free_bytes,
+            "gpu_memory_total_bytes": gpu_memory_total_bytes,
         }

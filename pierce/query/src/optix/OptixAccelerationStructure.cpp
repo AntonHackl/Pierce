@@ -1,21 +1,25 @@
 #include "OptixAccelerationStructure.h"
 #include "OptixHelpers.h"
 #include <iostream>
+#include "../utilities/GpuMemoryTracker.h"
 
 OptixAccelerationStructure::OptixAccelerationStructure(OptixContext& context, GeometryUploader& geometry)
     : context_(context), geometry_(geometry), gasHandle_(0),
-      d_tempBuffer_(0), d_gasOutput_(0), tempSize_(0), outputSize_(0) {
+      d_tempBuffer_(0), d_gasOutput_(0), tempSize_(0), outputSize_(0),
+      memoryTracker_(nullptr) {
 }
 
 OptixAccelerationStructure::~OptixAccelerationStructure() {
     freeInternal();
 }
 
-void OptixAccelerationStructure::build() {
+void OptixAccelerationStructure::build(GpuMemoryTracker* memoryTracker, const std::string& checkpointPrefix) {
     if (!geometry_.isUploaded()) {
         std::cerr << "Error: Geometry must be uploaded before building acceleration structure" << std::endl;
         return;
     }
+    memoryTracker_ = memoryTracker;
+    checkpointPrefix_ = checkpointPrefix;
     buildInternal();
 }
 
@@ -50,7 +54,13 @@ void OptixAccelerationStructure::buildInternal() {
     OPTIX_CHECK(optixAccelComputeMemoryUsage(context_.getContext(), &accelOptions, &buildInput, 1, &gasSizes));
     
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_tempBuffer_), gasSizes.tempSizeInBytes));
+    if (memoryTracker_) {
+        memoryTracker_->sample(checkpointPrefix_ + "_after_temp_alloc");
+    }
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gasOutput_), gasSizes.outputSizeInBytes));
+    if (memoryTracker_) {
+        memoryTracker_->sample(checkpointPrefix_ + "_after_output_alloc");
+    }
     
     tempSize_ = gasSizes.tempSizeInBytes;
     outputSize_ = gasSizes.outputSizeInBytes;
@@ -59,10 +69,16 @@ void OptixAccelerationStructure::buildInternal() {
                                  d_tempBuffer_, gasSizes.tempSizeInBytes,
                                  d_gasOutput_, gasSizes.outputSizeInBytes,
                                  &gasHandle_, nullptr, 0));
+    if (memoryTracker_) {
+        memoryTracker_->sample(checkpointPrefix_ + "_after_build", true);
+    }
     
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_tempBuffer_)));
     d_tempBuffer_ = 0;
     tempSize_ = 0;
+    if (memoryTracker_) {
+        memoryTracker_->sample(checkpointPrefix_ + "_after_temp_free");
+    }
     
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -80,4 +96,3 @@ void OptixAccelerationStructure::freeInternal() {
     }
     gasHandle_ = 0;
 }
-

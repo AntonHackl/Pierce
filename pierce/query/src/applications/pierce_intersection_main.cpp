@@ -32,6 +32,7 @@
 #include "../ptx_utils.h"
 #include "../cuda/estimated_intersection.h"
 #include "app_cli_options.h"
+#include "../utilities/GpuMemoryTracker.h"
 #include "../utilities/PairHitTracking.h"
 #include "../utilities/ContainmentTracking.h"
 
@@ -116,6 +117,7 @@ QueryResults executeHashQuery(
     unsigned long long* d_hash_table,
     int hash_table_size,
     QueryDirection queryDirection,
+    GpuMemoryTracker* memoryTracker = nullptr,
     PerformanceTimer* timer = nullptr,
     bool verbose = true
 ) {
@@ -188,6 +190,9 @@ QueryResults executeHashQuery(
 
     MeshQueryResult* d_merged_results = nullptr;
     CUDA_CHECK(cudaMalloc(&d_merged_results, max_output * sizeof(MeshQueryResult)));
+    if (memoryTracker) {
+        memoryTracker->sample("intersection_after_result_buffer_alloc");
+    }
 
     auto t_dedup_start = std::chrono::high_resolution_clock::now();
     int numUnique = compact_hash_table_pairs(d_hash_table, hash_table_size, d_merged_results, max_output);
@@ -372,6 +377,7 @@ public:
     float hashLoadFactor = 0.5f;
     int overlapMaxIterations = 100;
     int anyhitMaxTargetsPerSource = -1;
+    bool trackGpuMemory = false;
 
     void printHelp(const char* exeName) const {
         std::vector<HelpEntry> options;
@@ -386,6 +392,7 @@ public:
         options.emplace_back("--hash-load-factor <float>", "Hash load factor in (0,1] (default: 0.5)");
         options.emplace_back("--track-overflow", "Enable containment any-hit overflow summary diagnostics");
         options.emplace_back("--enable-profiling-stats", "Enable device-side profiling counters");
+        options.emplace_back("--track-gpu-memory", "Track GPU memory checkpoints and peak usage");
         options.emplace_back("--pairs-output <path>", "Intersection pairs CSV path (default: intersection_pairs.csv)");
         appendNoExportHelp(options);
         appendHelpFlag(options);
@@ -438,6 +445,10 @@ protected:
         }
         if (arg == "--pairs-output" && i + 1 < argc) {
             pairsOutputPath = argv[++i];
+            return true;
+        }
+        if (arg == "--track-gpu-memory") {
+            trackGpuMemory = true;
             return true;
         }
         return false;
@@ -592,6 +603,7 @@ int main(int argc, char* argv[]) {
     const float hashLoadFactor = options.hashLoadFactor;
     const int overlapMaxIterations = options.overlapMaxIterations;
     const int warmupRuns = options.warmupRuns;
+    const bool trackGpuMemory = options.trackGpuMemory;
     const bool anyhitCapExplicitlyConfigured = options.anyhitMaxTargetsPerSource > 0;
     int anyhitMaxTargetsPerSource = anyhitCapExplicitlyConfigured
         ? options.anyhitMaxTargetsPerSource
@@ -625,6 +637,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " --mesh1 <path> --mesh2 <path> [options]" << std::endl;
         return 1;
     }
+
+    GpuMemoryTracker memoryTracker(trackGpuMemory);
     
     timer.start("Load Mesh1");
     GeometryData mesh1 = loadGeometryFromFile(mesh1Path);
@@ -698,18 +712,21 @@ int main(int argc, char* argv[]) {
 
     GeometryUploader mesh1Uploader;
     mesh1Uploader.upload(mesh1);
+    memoryTracker.sample("intersection_after_upload_mesh1");
 
     timer.next("Upload Mesh2");
     GeometryUploader mesh2Uploader;
     mesh2Uploader.upload(mesh2);
+    memoryTracker.sample("intersection_after_upload_mesh2");
 
     timer.next("Build Mesh1 Index");
     OptixAccelerationStructure mesh1AS(context, mesh1Uploader);
-    mesh1AS.build();
+    mesh1AS.build(&memoryTracker, "build_mesh1_gas");
 
     timer.next("Build Mesh2 Index");
     OptixAccelerationStructure mesh2AS(context, mesh2Uploader);
-    mesh2AS.build();
+    mesh2AS.build(&memoryTracker, "build_mesh2_gas");
+    memoryTracker.sample("intersection_after_build_mesh2_index", true);
 
     timer.next("Prepare Kernel Parameters");
 
@@ -723,6 +740,7 @@ int main(int argc, char* argv[]) {
     // Allocate Hash Table
     unsigned long long* d_hash_table = nullptr;
     CUDA_CHECK(cudaMalloc(&d_hash_table, hash_table_size * sizeof(unsigned long long)));
+    memoryTracker.sample("intersection_after_hash_table_alloc");
 
     MeshIntersectionProfilingStats* d_profiling_stats = nullptr;
     MeshIntersectionProfilingStats h_profiling_stats = {};
@@ -869,6 +887,7 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_hit_counts_mesh2, anyhitSlotsMesh2 * sizeof(unsigned int)));
         CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_count_mesh2, mesh2NumObjects * sizeof(unsigned int)));
         CUDA_CHECK(cudaMalloc(&d_anyhit_candidate_overflow_mesh2, mesh2NumObjects * sizeof(unsigned int)));
+        memoryTracker.sample("intersection_after_anyhit_buffers_alloc");
 
         params1.anyhit_max_pair_targets_per_source = cap;
         params1.anyhit_candidate_object_ids = d_anyhit_candidate_object_ids_mesh1;
@@ -954,6 +973,7 @@ int main(int argc, char* argv[]) {
                 mesh1NumObjects, mesh2NumObjects,
                 d_hash_table, hash_table_size, queryDirection,
                 nullptr,
+                nullptr,
                 false
             );
             if (warmupResults.d_merged_results) CUDA_CHECK(cudaFree(warmupResults.d_merged_results));
@@ -968,6 +988,7 @@ int main(int argc, char* argv[]) {
         mesh1NumEdges, mesh2NumEdges,
         mesh1NumObjects, mesh2NumObjects,
         d_hash_table, hash_table_size, queryDirection,
+        &memoryTracker,
         &timer
     );
 
@@ -1043,6 +1064,8 @@ int main(int argc, char* argv[]) {
     mesh1Uploader.free();
     mesh2Uploader.free();
 
+    memoryTracker.addToTimer(timer);
+    memoryTracker.printSummary();
     timer.finish(outputJsonPath);
     return 0;
 }

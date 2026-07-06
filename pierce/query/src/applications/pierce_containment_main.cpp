@@ -28,6 +28,7 @@
 #include "../timer.h"
 #include "../ptx_utils.h"
 #include "../cuda/estimated_intersection.h"
+#include "../utilities/GpuMemoryTracker.h"
 #include "app_cli_options.h"
 
 // Helper to calculate global average size of objects from grid statistics
@@ -205,6 +206,7 @@ public:
     float gamma = 0.8f;
     float epsilon = 0.001f;
     float hashLoadFactor = 0.5f;
+    bool trackGpuMemory = false;
 
     void printHelp(const char* exeName) const {
         std::vector<HelpEntry> options;
@@ -221,6 +223,7 @@ public:
         options.emplace_back("--gamma <float>", "Estimation gamma (default: 0.8)");
         options.emplace_back("--epsilon <float>", "Estimation epsilon (default: 0.001)");
         options.emplace_back("--hash-load-factor <float>", "Hash load factor for table sizing (default: 0.5)");
+        options.emplace_back("--track-gpu-memory", "Track GPU memory checkpoints and peak usage");
         appendNoExportHelp(options);
         appendHelpFlag(options);
 
@@ -265,6 +268,10 @@ protected:
             hashLoadFactor = std::stof(argv[++i]);
             return true;
         }
+        if (arg == "--track-gpu-memory") {
+            trackGpuMemory = true;
+            return true;
+        }
         return false;
     }
 };
@@ -293,6 +300,7 @@ int main(int argc, char* argv[]) {
     const bool exportResults = options.exportResults;
     const bool includeOverlapPairs = options.includeOverlapPairs;
     const bool enableTracking = options.enableTracking;
+    const bool trackGpuMemory = options.trackGpuMemory;
     const float gamma = options.gamma;
     const float epsilon = options.epsilon;
     const float hashLoadFactor = options.hashLoadFactor;
@@ -315,6 +323,8 @@ int main(int argc, char* argv[]) {
               << " (" << (anyhitCapExplicitlyConfigured ? "explicit" : "default") << ")" << std::endl;
     std::cout << "Overflow Tracking: " << (enableTracking ? "enabled" : "disabled") << std::endl;
     std::cout << "Include overlap pairs: " << (includeOverlapPairs ? "yes" : "no") << std::endl;
+
+    GpuMemoryTracker memoryTracker(trackGpuMemory);
 
     if (!options.hasRequiredMeshInputs()) {
         if (meshAPath.empty()) { std::cerr << "Error: --mesh1 (dataset A) required\n"; }
@@ -359,18 +369,21 @@ int main(int argc, char* argv[]) {
     timer.next("Upload Mesh A");
     GeometryUploader aUploader;
     aUploader.upload(meshAData);
+    memoryTracker.sample("containment_after_upload_mesh_a");
 
     timer.next("Upload Mesh B");
     GeometryUploader bUploader;
     bUploader.upload(meshBData);
+    memoryTracker.sample("containment_after_upload_mesh_b");
 
     timer.next("Build A Index");
     OptixAccelerationStructure aAS(context, aUploader);
-    aAS.build();
+    aAS.build(&memoryTracker, "build_mesh1_gas");
 
     timer.next("Build B Index");
     OptixAccelerationStructure bAS(context, bUploader);
-    bAS.build();
+    bAS.build(&memoryTracker, "build_mesh2_gas");
+    memoryTracker.sample("containment_after_build_mesh_b_index", true);
 
     // ---------------------------------------------------------------
     // Pre-compute first vertex per B-object (host side)
@@ -383,6 +396,7 @@ int main(int argc, char* argv[]) {
     EdgeMeshData bEdgeData = PrecomputedEdgeData::uploadFromGeometry(meshBData);
     int aNumEdges = aEdgeData.num_edges;
     int bNumEdges = bEdgeData.num_edges;
+    memoryTracker.sample("containment_after_edge_uploads");
 
     std::vector<float3> bFirstVertices(numBObjects);
     {
@@ -401,6 +415,7 @@ int main(int argc, char* argv[]) {
     CUDA_CHECK(cudaMalloc(&d_bFirstVertices, numBObjects * sizeof(float3)));
     CUDA_CHECK(cudaMemcpy(d_bFirstVertices, bFirstVertices.data(),
                           numBObjects * sizeof(float3), cudaMemcpyHostToDevice));
+    memoryTracker.sample("containment_after_first_vertices_alloc");
 
     // The point-in-mesh kernel uses one scratch row per B object ray.
     // Each row tracks up to anyhitMaxUniqueAObjects distinct A objects.
@@ -428,6 +443,7 @@ int main(int argc, char* argv[]) {
         if (enableTracking) {
             CUDA_CHECK(cudaMalloc(&d_anyhit_overflow_events, trackedBObjects * sizeof(unsigned int)));
         }
+        memoryTracker.sample("containment_after_anyhit_buffers_alloc");
     };
     allocateAnyhitBuffers(anyhitMaxUniqueAObjects);
 
@@ -470,6 +486,7 @@ int main(int argc, char* argv[]) {
     auto run_alloc_tables = [&]() {
         CUDA_CHECK(cudaMalloc(&d_intersectionHT, (size_t)intersectionHTSize * sizeof(unsigned long long)));
         CUDA_CHECK(cudaMalloc(&d_containmentHT,  (size_t)containmentHTSize  * sizeof(unsigned long long)));
+        memoryTracker.sample("containment_after_dual_hash_table_alloc");
     };
 
     auto runOnce = [&](bool verbose, bool recordBreakdownPhases) {
@@ -574,6 +591,7 @@ int main(int argc, char* argv[]) {
         int maxContainmentOutput = 2000000;
         MeshQueryResult* d_containment_results = nullptr;
         CUDA_CHECK(cudaMalloc(&d_containment_results, maxContainmentOutput * sizeof(MeshQueryResult)));
+        memoryTracker.sample("containment_after_containment_result_alloc");
 
         auto t_dedup_0 = std::chrono::high_resolution_clock::now();
         int numContained = compact_hash_table_pairs(
@@ -607,6 +625,7 @@ int main(int argc, char* argv[]) {
             int maxOverlapOutput = 2000000;
             MeshQueryResult* d_overlap_results = nullptr;
             CUDA_CHECK(cudaMalloc(&d_overlap_results, maxOverlapOutput * sizeof(MeshQueryResult)));
+            memoryTracker.sample("containment_after_overlap_result_alloc");
 
             auto t_dedup_overlap_0 = std::chrono::high_resolution_clock::now();
             int numOverlap = compact_hash_table_pairs(
@@ -735,6 +754,8 @@ int main(int argc, char* argv[]) {
     PrecomputedEdgeData::freeEdgeData(aEdgeData);
     PrecomputedEdgeData::freeEdgeData(bEdgeData);
 
+    memoryTracker.addToTimer(timer);
+    memoryTracker.printSummary();
     timer.finish(outputJsonPath);
 
     std::cout << "\nContainment query completed successfully." << std::endl;

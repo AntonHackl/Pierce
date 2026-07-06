@@ -74,6 +74,7 @@ def main():
     parser.add_argument("--track-overflow", action="store_true")
     parser.add_argument("--enable-profiling-stats", action="store_true")
     parser.add_argument("--include-overlap-pairs", action="store_true")
+    parser.add_argument("--track-gpu-memory", action="store_true")
     args = parser.parse_args()
     forced_nu_counts = _forced_nu_counts_for_profile(args.dataset_profile)
     if args.nu != forced_nu_counts:
@@ -104,6 +105,7 @@ def main():
         overlap_mode=args.overlap_mode,
         intersection_mode=args.intersection_mode,
         include_overlap_pairs=args.include_overlap_pairs,
+        track_gpu_memory=args.track_gpu_memory,
         overlap_max_iterations=int(args.overlap_max_iterations),
     )
 
@@ -112,6 +114,7 @@ def main():
         hash_load_factor=args.hash_load_factor,
         track_overflow=args.track_overflow,
         enable_profiling_stats=args.enable_profiling_stats,
+        track_gpu_memory=args.track_gpu_memory,
         intersection_query_direction=args.intersection_query_direction,
     )
 
@@ -207,6 +210,7 @@ def main():
                 "track_overflow": args.track_overflow,
                 "enable_profiling_stats": args.enable_profiling_stats,
                 "include_overlap_pairs": args.include_overlap_pairs,
+                "track_gpu_memory": args.track_gpu_memory,
                 "shared_data_root": str(shared_dirs["root"]),
                 "isolated_data_root": str(isolated_data_dirs["root"]),
             },

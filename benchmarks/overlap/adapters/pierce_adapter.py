@@ -21,6 +21,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         hash_table_size: Optional[int] = None,
         hash_table_free_mem_fraction: Optional[float] = None,
         overlap_max_iterations: int = 100,
+        track_gpu_memory: bool = False,
     ):
         """
         mode: 'exact' or 'direct_estimation'
@@ -40,6 +41,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         self.hash_table_size = hash_table_size
         self.hash_table_free_mem_fraction = hash_table_free_mem_fraction
         self.overlap_max_iterations = overlap_max_iterations
+        self.track_gpu_memory = track_gpu_memory
         # Ensure directories exist
         self.timings_dir.mkdir(parents=True, exist_ok=True)
         self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
@@ -145,6 +147,9 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         result_buffer_capacity = 0
         result_buffer_allocated_bytes = 0
         result_buffer_used_bytes = 0
+        gpu_memory_peak_used_bytes = 0
+        gpu_memory_peak_free_bytes = 0
+        gpu_memory_total_bytes = 0
         
         print(f"[{self.name}] Running benchmark...")
 
@@ -194,6 +199,8 @@ class PierceAdapter(OverlapBenchmarkAdapter):
                     cmd.extend(["--hash-table-size", str(self.hash_table_size)])
                 elif self.hash_table_free_mem_fraction is not None:
                     cmd.extend(["--hash-table-free-mem-fraction", str(self.hash_table_free_mem_fraction)])
+                if self.track_gpu_memory:
+                    cmd.append("--track-gpu-memory")
             
             if self.mode in ("direct_estimation", "estimated"):
                 if pairs_output and run_idx == (num_runs - 1):
@@ -328,10 +335,14 @@ class PierceAdapter(OverlapBenchmarkAdapter):
                     data = json.load(f)
 
                 phases = data.get("phases", {})
+                counters = data.get("counters", {})
                 phase_values = {}
                 for key, phase_data in phases.items():
                     normalized_key = re.sub(r"_\d+$", "", key.lower())
                     phase_values[normalized_key] = phase_values.get(normalized_key, 0.0) + phase_data.get("duration_ms", 0.0)
+                gpu_memory_peak_used_bytes = int(counters.get("gpu_memory_peak_used_bytes", gpu_memory_peak_used_bytes))
+                gpu_memory_peak_free_bytes = int(counters.get("gpu_memory_peak_free_bytes", gpu_memory_peak_free_bytes))
+                gpu_memory_total_bytes = int(counters.get("gpu_memory_total_bytes", gpu_memory_total_bytes))
 
                 has_detailed_raytrace = any(k.startswith("raytrace_") for k in phase_values.keys())
 
@@ -430,4 +441,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
             "result_buffer_capacity": result_buffer_capacity,
             "result_buffer_allocated_bytes": result_buffer_allocated_bytes,
             "result_buffer_used_bytes": result_buffer_used_bytes,
+            "gpu_memory_peak_used_bytes": gpu_memory_peak_used_bytes,
+            "gpu_memory_peak_free_bytes": gpu_memory_peak_free_bytes,
+            "gpu_memory_total_bytes": gpu_memory_total_bytes,
         }

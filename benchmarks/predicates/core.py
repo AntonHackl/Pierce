@@ -93,6 +93,7 @@ def build_pierce_query_adapters(
     overlap_mode: str,
     intersection_mode: str,
     include_overlap_pairs: bool,
+    track_gpu_memory: bool = False,
     overlap_max_iterations: int = 100,
 ) -> Dict[str, Any]:
     pierce_dir = repo_root / "pierce"
@@ -105,6 +106,7 @@ def build_pierce_query_adapters(
         grid_cell_size=grid_cell_size,
         warmup_runs=warmup_runs,
         overlap_max_iterations=overlap_max_iterations,
+        track_gpu_memory=track_gpu_memory,
     )
     intersection = PierceIntersectionAdapter(
         str(pierce_dir),
@@ -199,6 +201,7 @@ def build_intersection_extra_args(
     hash_load_factor: float,
     enable_profiling_stats: bool,
     track_overflow: bool,
+    track_gpu_memory: bool,
     intersection_query_direction: str,
 ) -> list[str]:
     args = [
@@ -213,6 +216,8 @@ def build_intersection_extra_args(
         args.append("--enable-profiling-stats")
     if track_overflow:
         args.append("--track-overflow")
+    if track_gpu_memory:
+        args.append("--track-gpu-memory")
     return args
 
 

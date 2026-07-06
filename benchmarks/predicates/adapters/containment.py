@@ -95,6 +95,9 @@ class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
         num_containments = 0
         num_overlaps = 0
         num_reported_pairs = 0
+        gpu_memory_peak_used_bytes = 0
+        gpu_memory_peak_free_bytes = 0
+        gpu_memory_total_bytes = 0
 
         adapter_log_dir = None
         if log_dir:
@@ -154,10 +157,14 @@ class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
                     data = json.load(f)
 
                 phases = data.get("phases", {})
+                counters = data.get("counters", {})
                 phase_values = {}
                 for key, phase_data in phases.items():
                     normalized_key = re.sub(r"_\d+$", "", key.lower())
                     phase_values[normalized_key] = phase_values.get(normalized_key, 0.0) + phase_data.get("duration_ms", 0.0)
+                gpu_memory_peak_used_bytes = int(counters.get("gpu_memory_peak_used_bytes", gpu_memory_peak_used_bytes))
+                gpu_memory_peak_free_bytes = int(counters.get("gpu_memory_peak_free_bytes", gpu_memory_peak_free_bytes))
+                gpu_memory_total_bytes = int(counters.get("gpu_memory_total_bytes", gpu_memory_total_bytes))
 
                 # Explicitly sum components to ensure consistency with breakdown
                 components = [
@@ -220,4 +227,7 @@ class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
             "num_overlaps": int(num_overlaps),
             "num_reported_pairs": int(num_reported_pairs or num_containments),
             "breakdown": breakdown_stats,
+            "gpu_memory_peak_used_bytes": gpu_memory_peak_used_bytes,
+            "gpu_memory_peak_free_bytes": gpu_memory_peak_free_bytes,
+            "gpu_memory_total_bytes": gpu_memory_total_bytes,
         }

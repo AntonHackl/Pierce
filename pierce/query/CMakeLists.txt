@@ -136,6 +136,9 @@ set(RAYTRACING_SOURCES
 set(RUNTIME_SOURCES
     ${SRC_DIR}/runtime/GeometryIO.cpp)
 
+set(UTILITY_SOURCES
+    ${SRC_DIR}/utilities/GpuMemoryTracker.cpp)
+
 # -----------------------------------------------------------------------
 # PTX Compilation
 # -----------------------------------------------------------------------
@@ -165,6 +168,7 @@ add_executable(pierce_overlap_two_pass
     ${OPTIX_SOURCES} 
     ${GEOMETRY_SOURCES} 
     ${RAYTRACING_SOURCES} 
+    ${UTILITY_SOURCES}
     ${RESULT_COMPACTION_SOURCE} 
     ${MESH_QUERY_DEDUP_SOURCE} 
     ${SCAN_UTILS_SOURCE})
@@ -176,6 +180,7 @@ add_executable(pierce_intersection
     ${OPTIX_SOURCES}
     ${GEOMETRY_SOURCES}
     ${RAYTRACING_SOURCES}
+    ${UTILITY_SOURCES}
     ${RESULT_COMPACTION_SOURCE}
     ${MESH_QUERY_DEDUP_SOURCE}
     ${SCAN_UTILS_SOURCE}
@@ -188,6 +193,7 @@ add_executable(pierce_overlap
     ${OPTIX_SOURCES}
     ${GEOMETRY_SOURCES}
     ${RAYTRACING_SOURCES}
+    ${UTILITY_SOURCES}
     ${RESULT_COMPACTION_SOURCE}
     ${MESH_QUERY_DEDUP_SOURCE}
     ${SCAN_UTILS_SOURCE}
@@ -200,6 +206,7 @@ add_executable(pierce_containment
     ${OPTIX_SOURCES}
     ${GEOMETRY_SOURCES}
     ${RAYTRACING_SOURCES}
+    ${UTILITY_SOURCES}
     ${RESULT_COMPACTION_SOURCE}
     ${MESH_QUERY_DEDUP_SOURCE}
     ${SCAN_UTILS_SOURCE}
