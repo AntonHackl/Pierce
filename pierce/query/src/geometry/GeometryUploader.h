@@ -14,7 +14,7 @@ public:
     GeometryUploader& operator=(const GeometryUploader&) = delete;
     
     void upload(const GeometryData& geometry);
-    
+
     void upload(const std::vector<float3>& vertices,
                 const std::vector<uint3>& indices,
                 const std::vector<int>& triangleToObject);
@@ -41,4 +41,3 @@ private:
     
     void freeInternal();
 };
-

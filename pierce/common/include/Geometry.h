@@ -55,22 +55,48 @@ struct AxisIntervalData {
     }
 };
 
+inline constexpr uint32_t DEFAULT_PARTITION_WEIGHT_HISTOGRAM_BINS = 4096;
+inline constexpr double PARTITION_TRIANGLE_WEIGHT_BYTES =
+    sizeof(uint3) + sizeof(int) + sizeof(float) * 3.0;
+inline constexpr double PARTITION_EDGE_WEIGHT_BYTES =
+    sizeof(float3) * 2.0 + sizeof(int);
+
+struct PartitionWeightSummary {
+    float triangleMinX = 0.0f;
+    float triangleMaxX = 0.0f;
+    float centerMinX = 0.0f;
+    float centerMaxX = 0.0f;
+    double totalWeight = 0.0;
+    std::vector<double> binWeights;
+
+    bool hasData() const {
+        return !binWeights.empty() &&
+               totalWeight > 0.0 &&
+               triangleMinX <= triangleMaxX &&
+               centerMinX <= centerMaxX;
+    }
+};
+
 struct PartitionMetadata {
     AxisIntervalData triangles;
     AxisIntervalData edges;
     AxisIntervalData objects;
+    PartitionWeightSummary weightSummary;
 
-    std::vector<uint32_t> triangleSortedByCenter;
-    std::vector<uint32_t> edgeSortedByCenter;
-    std::vector<uint32_t> objectSortedByCenter;
+    std::vector<uint32_t> triangleSortedByMin;
+    std::vector<uint32_t> triangleSortedByMax;
+    std::vector<uint32_t> edgeSortedByMin;
+    std::vector<uint32_t> edgeSortedByMax;
 
     bool hasData() const {
         return triangles.hasData() &&
                edges.hasData() &&
                objects.hasData() &&
-               triangleSortedByCenter.size() == triangles.size() &&
-               edgeSortedByCenter.size() == edges.size() &&
-               objectSortedByCenter.size() == objects.size();
+               triangleSortedByMin.size() == triangles.size() &&
+               triangleSortedByMax.size() == triangles.size() &&
+               edgeSortedByMin.size() == edges.size() &&
+               edgeSortedByMax.size() == edges.size() &&
+               weightSummary.hasData();
     }
 };
 

@@ -3,6 +3,8 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/execution_policy.h>
+#include <chrono>
+#include <stdexcept>
 #include "../optix/OptixHelpers.h"
 
 __device__ __host__ inline unsigned long long pair_to_key(int id1, int id2) {
@@ -193,3 +195,85 @@ unsigned long long count_hash_table_pairs(
 }
 
 } // extern "C"
+
+GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
+    const std::vector<DevicePairBuffer>& worker_buffers,
+    int aggregator_device_id
+) {
+    using Clock = std::chrono::high_resolution_clock;
+
+    GpuGlobalDedupResult result;
+    result.aggregatorDeviceId = aggregator_device_id;
+
+    for (const DevicePairBuffer& buffer : worker_buffers) {
+        if (buffer.count < 0) {
+            throw std::runtime_error("Global GPU dedup received a negative pair count.");
+        }
+        result.inputCount += buffer.count;
+    }
+
+    CUDA_CHECK(cudaSetDevice(aggregator_device_id));
+    if (result.inputCount == 0) {
+        return result;
+    }
+
+    MeshQueryResult* d_all_pairs = nullptr;
+    CUDA_CHECK(cudaMalloc(
+        &d_all_pairs,
+        static_cast<size_t>(result.inputCount) * sizeof(MeshQueryResult)
+    ));
+
+    auto gather_start = Clock::now();
+    long long offset = 0;
+    for (const DevicePairBuffer& buffer : worker_buffers) {
+        if (buffer.count == 0) {
+            continue;
+        }
+        if (buffer.d_pairs == nullptr) {
+            CUDA_CHECK(cudaFree(d_all_pairs));
+            throw std::runtime_error("Global GPU dedup received a null device pair buffer.");
+        }
+
+        const size_t bytes = static_cast<size_t>(buffer.count) * sizeof(MeshQueryResult);
+        if (buffer.deviceId == aggregator_device_id) {
+            CUDA_CHECK(cudaSetDevice(aggregator_device_id));
+            CUDA_CHECK(cudaMemcpy(
+                d_all_pairs + offset,
+                buffer.d_pairs,
+                bytes,
+                cudaMemcpyDeviceToDevice
+            ));
+        } else {
+            CUDA_CHECK(cudaMemcpyPeer(
+                d_all_pairs + offset,
+                aggregator_device_id,
+                buffer.d_pairs,
+                buffer.deviceId,
+                bytes
+            ));
+        }
+
+        CUDA_CHECK(cudaSetDevice(buffer.deviceId));
+        CUDA_CHECK(cudaFree(buffer.d_pairs));
+        offset += buffer.count;
+    }
+    CUDA_CHECK(cudaSetDevice(aggregator_device_id));
+    result.gatherUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - gather_start
+    ).count();
+
+    auto dedup_start = Clock::now();
+    result.uniqueCount = merge_and_deduplicate_pairs_gpu(
+        nullptr,
+        result.inputCount,
+        nullptr,
+        0,
+        d_all_pairs
+    );
+    result.d_uniquePairs = d_all_pairs;
+    result.dedupUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        Clock::now() - dedup_start
+    ).count();
+
+    return result;
+}

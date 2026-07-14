@@ -14,7 +14,6 @@
 #include <chrono>
 #include <limits>
 #include <unordered_map>
-#include <unordered_set>
 #include <iomanip>
 #include <thread>
 #include <mutex>
@@ -52,11 +51,6 @@ enum class QueryDirection {
     Mesh2ToMesh1
 };
 
-static unsigned long long packOverlapPairKey(int mesh1ObjectId, int mesh2ObjectId) {
-    return (static_cast<unsigned long long>(static_cast<unsigned int>(mesh1ObjectId)) << 32) |
-        static_cast<unsigned long long>(static_cast<unsigned int>(mesh2ObjectId));
-}
-
 struct OverlapExecutionConfig {
     QueryDirection direction = QueryDirection::Both;
     bool trackHashContention = false;
@@ -67,7 +61,9 @@ struct OverlapExecutionConfig {
 };
 
 struct OverlapGpuWorkerResult {
-    std::vector<MeshQueryResult> pairs;
+    MeshQueryResult* dPairs = nullptr;
+    long long numPairs = 0;
+    int deviceId = 0;
     unsigned long long hashAccesses = 0;
     unsigned long long hashContentions = 0;
     unsigned long long hashTableSize = 0;
@@ -342,6 +338,7 @@ static OverlapGpuWorkerResult runOverlapOnCurrentDevice(
 
     OverlapGpuWorkerResult workerResult;
     workerResult.slabIndex = slabPair.slabIndex;
+    workerResult.deviceId = deviceId;
     workerResult.hashAccesses = queryResults.hashAccesses;
     workerResult.hashContentions = queryResults.hashContentions;
     workerResult.hashTableSize = slabPair.hashTableSize;
@@ -349,13 +346,9 @@ static OverlapGpuWorkerResult runOverlapOnCurrentDevice(
     workerResult.peakMemoryBytes = memoryTracker.getPeakUsedBytes();
 
     if (queryResults.numUnique > 0) {
-        workerResult.pairs.resize(queryResults.numUnique);
-        CUDA_CHECK(cudaMemcpy(
-            workerResult.pairs.data(),
-            queryResults.d_merged_results,
-            static_cast<size_t>(queryResults.numUnique) * sizeof(MeshQueryResult),
-            cudaMemcpyDeviceToHost
-        ));
+        workerResult.dPairs = queryResults.d_merged_results;
+        workerResult.numPairs = queryResults.numUnique;
+        queryResults.d_merged_results = nullptr;
     }
 
     if (queryResults.d_merged_results) CUDA_CHECK(cudaFree(queryResults.d_merged_results));
@@ -368,34 +361,127 @@ static OverlapGpuWorkerResult runOverlapOnCurrentDevice(
     return workerResult;
 }
 
-static std::vector<MeshQueryResult> mergeAndDeduplicateOverlapPairs(
-    const std::vector<OverlapGpuWorkerResult>& workerResults
+static void printAndRecordSlabMemoryStats(
+    const std::vector<SlabGeometryPair>& slabPairs,
+    PerformanceTimer& timer
 ) {
-    std::unordered_set<unsigned long long> seen;
-    size_t totalPairs = 0;
-    for (const auto& workerResult : workerResults) {
-        totalPairs += workerResult.pairs.size();
-    }
-    seen.reserve(totalPairs);
+    const std::vector<SlabMemoryStats> memoryStats = computeSlabMemoryStats(slabPairs);
+    unsigned long long totalPlannedBytes = 0;
+    unsigned long long minPlannedBytes = std::numeric_limits<unsigned long long>::max();
+    unsigned long long maxPlannedBytes = 0;
 
-    std::vector<MeshQueryResult> mergedPairs;
-    mergedPairs.reserve(totalPairs);
-    for (const auto& workerResult : workerResults) {
-        for (const MeshQueryResult& pair : workerResult.pairs) {
-            const unsigned long long key = packOverlapPairKey(pair.object_id_mesh1, pair.object_id_mesh2);
-            if (seen.insert(key).second) {
-                mergedPairs.push_back(pair);
-            }
-        }
+    for (const SlabMemoryStats& stats : memoryStats) {
+        totalPlannedBytes += stats.totalPlannedBytes;
+        minPlannedBytes = std::min(minPlannedBytes, stats.totalPlannedBytes);
+        maxPlannedBytes = std::max(maxPlannedBytes, stats.totalPlannedBytes);
+    }
+    if (memoryStats.empty()) {
+        minPlannedBytes = 0;
+    }
+    const unsigned long long avgPlannedBytes = memoryStats.empty()
+        ? 0
+        : totalPlannedBytes / static_cast<unsigned long long>(memoryStats.size());
+    const unsigned long long maxAvgRatioX1000 = avgPlannedBytes > 0
+        ? (maxPlannedBytes * 1000ULL) / avgPlannedBytes
+        : 0;
+
+    const std::ios::fmtflags oldFlags = std::cout.flags();
+    const std::streamsize oldPrecision = std::cout.precision();
+    std::cout << "\n=== Planned Per-GPU Memory Distribution ===" << std::endl;
+    for (size_t slabOffset = 0; slabOffset < slabPairs.size(); ++slabOffset) {
+        const SlabGeometryPair& slabPair = slabPairs[slabOffset];
+        const SlabMemoryStats& stats = memoryStats[slabOffset];
+        const double pct = totalPlannedBytes > 0
+            ? 100.0 * static_cast<double>(stats.totalPlannedBytes) / static_cast<double>(totalPlannedBytes)
+            : 0.0;
+        std::cout << std::fixed << std::setprecision(2)
+                  << "Slab " << slabPair.slabIndex
+                  << ": mesh1 triangles=" << slabPair.mesh1.numTriangles()
+                  << ", mesh1 edges=" << slabPair.mesh1.numEdges()
+                  << ", mesh2 triangles=" << slabPair.mesh2.numTriangles()
+                  << ", mesh2 edges=" << slabPair.mesh2.numEdges()
+                  << ", estimated_geometry_bytes=" << stats.estimatedGeometryBytes
+                  << ", hash_table_bytes=" << stats.hashTableBytes
+                  << ", total_planned_bytes=" << stats.totalPlannedBytes
+                  << ", planned_pct=" << pct
+                  << ", hash_table_size=" << slabPair.hashTableSize << std::endl;
+
+        const std::string prefix = "Profile_Slab_" + std::to_string(slabPair.slabIndex);
+        timer.addCounter(prefix + "_Mesh1_Triangles", static_cast<unsigned long long>(slabPair.mesh1.numTriangles()));
+        timer.addCounter(prefix + "_Mesh1_Edges", static_cast<unsigned long long>(slabPair.mesh1.numEdges()));
+        timer.addCounter(prefix + "_Mesh2_Triangles", static_cast<unsigned long long>(slabPair.mesh2.numTriangles()));
+        timer.addCounter(prefix + "_Mesh2_Edges", static_cast<unsigned long long>(slabPair.mesh2.numEdges()));
+        timer.addCounter(prefix + "_Estimated_Geometry_Bytes", stats.estimatedGeometryBytes);
+        timer.addCounter(prefix + "_Hash_Table_Bytes", stats.hashTableBytes);
+        timer.addCounter(prefix + "_Total_Planned_Bytes", stats.totalPlannedBytes);
+        timer.addCounter(prefix + "_Planned_Pct_x1000", static_cast<unsigned long long>(pct * 1000.0));
+    }
+    std::cout.flags(oldFlags);
+    std::cout.precision(oldPrecision);
+
+    timer.addCounter("Profile_Planned_Memory_Min_Bytes", minPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Max_Bytes", maxPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Avg_Bytes", avgPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Max_Avg_Ratio_x1000", maxAvgRatioX1000);
+}
+
+static void recordSlabPlanningTimingStats(
+    const SlabPlanningTimingStats& stats,
+    long long memoryStatsUs,
+    PerformanceTimer& timer
+) {
+    timer.addMeasurement("Plan Detail Boundary CDF", stats.boundaryCdfUs);
+    timer.addMeasurement("Plan Detail Boundary Search", stats.boundarySearchUs);
+    timer.addMeasurement("Plan Detail Mesh1 Launch Points", stats.mesh1LaunchPointsUs);
+    timer.addMeasurement("Plan Detail Mesh2 Launch Points", stats.mesh2LaunchPointsUs);
+    timer.addMeasurement("Plan Detail Mesh1 Owner Assign", stats.mesh1OwnerAssignUs);
+    timer.addMeasurement("Plan Detail Mesh2 Owner Assign", stats.mesh2OwnerAssignUs);
+    timer.addMeasurement("Plan Detail Mesh1 Active Setup", stats.mesh1ActiveSetupUs);
+    timer.addMeasurement("Plan Detail Mesh2 Active Setup", stats.mesh2ActiveSetupUs);
+    timer.addMeasurement("Plan Detail Mesh1 Endpoint Sweep", stats.mesh1EndpointSweepUs);
+    timer.addMeasurement("Plan Detail Mesh2 Endpoint Sweep", stats.mesh2EndpointSweepUs);
+    timer.addMeasurement("Plan Detail Mesh1 Copy Sort", stats.mesh1ActiveCopySortUs);
+    timer.addMeasurement("Plan Detail Mesh2 Copy Sort", stats.mesh2ActiveCopySortUs);
+    timer.addMeasurement("Plan Detail Mesh1 Materialize", stats.mesh1MaterializeUs);
+    timer.addMeasurement("Plan Detail Mesh2 Materialize", stats.mesh2MaterializeUs);
+    timer.addMeasurement("Plan Detail Mesh1 Object Metadata", stats.mesh1ObjectMetadataUs);
+    timer.addMeasurement("Plan Detail Mesh2 Object Metadata", stats.mesh2ObjectMetadataUs);
+    timer.addMeasurement("Plan Detail Pair Assembly", stats.pairAssemblyUs);
+    timer.addMeasurement("Plan Detail Memory Stats", memoryStatsUs);
+}
+
+static void recordOverlapPeakMemoryStats(
+    const std::vector<OverlapGpuWorkerResult>& workerResults,
+    PerformanceTimer& timer
+) {
+    unsigned long long totalPeakBytes = 0;
+    unsigned long long minPeakBytes = std::numeric_limits<unsigned long long>::max();
+    unsigned long long maxPeakBytes = 0;
+
+    for (const OverlapGpuWorkerResult& workerResult : workerResults) {
+        totalPeakBytes += workerResult.peakMemoryBytes;
+        minPeakBytes = std::min(minPeakBytes, workerResult.peakMemoryBytes);
+        maxPeakBytes = std::max(maxPeakBytes, workerResult.peakMemoryBytes);
+        timer.addCounter(
+            "Profile_Slab_" + std::to_string(workerResult.slabIndex) + "_GPU_Peak_Used_Bytes",
+            workerResult.peakMemoryBytes
+        );
+    }
+    if (workerResults.empty()) {
+        minPeakBytes = 0;
     }
 
-    std::sort(mergedPairs.begin(), mergedPairs.end(), [](const MeshQueryResult& lhs, const MeshQueryResult& rhs) {
-        if (lhs.object_id_mesh1 != rhs.object_id_mesh1) {
-            return lhs.object_id_mesh1 < rhs.object_id_mesh1;
-        }
-        return lhs.object_id_mesh2 < rhs.object_id_mesh2;
-    });
-    return mergedPairs;
+    const unsigned long long avgPeakBytes = workerResults.empty()
+        ? 0
+        : totalPeakBytes / static_cast<unsigned long long>(workerResults.size());
+    const unsigned long long maxAvgRatioX1000 = avgPeakBytes > 0
+        ? (maxPeakBytes * 1000ULL) / avgPeakBytes
+        : 0;
+
+    timer.addCounter("Profile_GPU_Peak_Min_Used_Bytes", minPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Max_Used_Bytes", maxPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Avg_Used_Bytes", avgPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Max_Avg_Ratio_x1000", maxAvgRatioX1000);
 }
 
 // Helper to calculate global average size of objects from grid statistics
@@ -794,8 +880,15 @@ int main(int argc, char* argv[]) {
         }
 
         timer.next("Plan Shared Slabs");
-        const SlabPartitionPlan slabPlan = planSharedXAxisSlabs(mesh1, mesh2, activeGpuCount);
-        std::vector<SlabGeometryPair> slabPairs = buildSlabGeometryPairs(mesh1, mesh2, slabPlan, static_cast<int>(hash_table_size));
+        SlabPlanningTimingStats slabPlanningTiming;
+        const SlabPartitionPlan slabPlan = planSharedXAxisSlabs(mesh1, mesh2, activeGpuCount, &slabPlanningTiming);
+        std::vector<SlabGeometryPair> slabPairs = buildSlabGeometryPairs(
+            mesh1,
+            mesh2,
+            slabPlan,
+            static_cast<int>(hash_table_size),
+            &slabPlanningTiming
+        );
         if (run == 0) {
             std::cout << "\n=== Selectivity Estimation (Overlap - Direct) ===" << std::endl;
             std::cout << "Final Estimated Pairs:     " << estimatedPairs << std::endl;
@@ -806,14 +899,12 @@ int main(int argc, char* argv[]) {
             } else {
                 std::cout << "Using Direct Estimated Hash Table Size: " << hash_table_size << std::endl;
             }
-            for (const SlabGeometryPair& slabPair : slabPairs) {
-                std::cout << "Slab " << slabPair.slabIndex
-                          << ": mesh1 triangles=" << slabPair.mesh1.geometry.indices.size()
-                          << ", mesh1 edges=" << slabPair.mesh1.geometry.edges.edgeStarts.size()
-                          << ", mesh2 triangles=" << slabPair.mesh2.geometry.indices.size()
-                          << ", mesh2 edges=" << slabPair.mesh2.geometry.edges.edgeStarts.size()
-                          << ", hash_table_size=" << slabPair.hashTableSize << std::endl;
-            }
+            const auto memoryStatsStart = std::chrono::high_resolution_clock::now();
+            printAndRecordSlabMemoryStats(slabPairs, timer);
+            const long long memoryStatsUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - memoryStatsStart
+            ).count();
+            recordSlabPlanningTimingStats(slabPlanningTiming, memoryStatsUs, timer);
         }
 
         OverlapExecutionConfig executionConfig;
@@ -858,9 +949,21 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        timer.next("Download Results");
-        hostResults = mergeAndDeduplicateOverlapPairs(workerResults);
-        finalNumUnique = static_cast<int>(hostResults.size());
+        timer.next("Global GPU Deduplication");
+        std::vector<DevicePairBuffer> workerBuffers;
+        workerBuffers.reserve(workerResults.size());
+        for (const auto& workerResult : workerResults) {
+            workerBuffers.push_back({workerResult.deviceId, workerResult.dPairs, workerResult.numPairs});
+        }
+        GpuGlobalDedupResult globalDedupResult;
+        try {
+            globalDedupResult = gather_and_deduplicate_pairs_gpu(workerBuffers, 0);
+        } catch (const std::exception& ex) {
+            std::cerr << "Global GPU deduplication failed: " << ex.what() << std::endl;
+            return 1;
+        }
+        hostResults.clear();
+        finalNumUnique = static_cast<int>(globalDedupResult.uniqueCount);
         finalHashAccesses = 0;
         finalHashContentions = 0;
         finalResultBufferCapacity = 0;
@@ -875,8 +978,39 @@ int main(int argc, char* argv[]) {
         }
 
         timer.addCounter("Profile_Active_GPU_Count", static_cast<unsigned long long>(activeGpuCount));
+        timer.addCounter("Profile_Global_Dedup_Mode", 1ULL);
+        timer.addCounter("Profile_Global_Dedup_Aggregator_Device", static_cast<unsigned long long>(globalDedupResult.aggregatorDeviceId));
+        timer.addCounter("Profile_Global_Dedup_Input_Pairs", static_cast<unsigned long long>(globalDedupResult.inputCount));
+        timer.addCounter("Profile_Global_Dedup_Unique_Pairs", static_cast<unsigned long long>(globalDedupResult.uniqueCount));
+        timer.addCounter("Profile_Global_Dedup_Gather_Us", static_cast<unsigned long long>(globalDedupResult.gatherUs));
+        timer.addCounter("Profile_Global_Dedup_SortUnique_Us", static_cast<unsigned long long>(globalDedupResult.dedupUs));
+        timer.addCounter("Profile_Global_Dedup_Total_Us", static_cast<unsigned long long>(globalDedupResult.gatherUs + globalDedupResult.dedupUs));
+        timer.addCounter(
+            "Profile_Global_Dedup_Buffer_Bytes",
+            static_cast<unsigned long long>(globalDedupResult.inputCount) * static_cast<unsigned long long>(sizeof(MeshQueryResult))
+        );
+
+        if (!pairsOutputPath.empty() && globalDedupResult.uniqueCount > 0) {
+            timer.next("Download Results");
+            hostResults.resize(static_cast<size_t>(globalDedupResult.uniqueCount));
+            CUDA_CHECK(cudaSetDevice(globalDedupResult.aggregatorDeviceId));
+            CUDA_CHECK(cudaMemcpy(
+                hostResults.data(),
+                globalDedupResult.d_uniquePairs,
+                static_cast<size_t>(globalDedupResult.uniqueCount) * sizeof(MeshQueryResult),
+                cudaMemcpyDeviceToHost
+            ));
+        }
+        if (globalDedupResult.d_uniquePairs) {
+            CUDA_CHECK(cudaSetDevice(globalDedupResult.aggregatorDeviceId));
+            CUDA_CHECK(cudaFree(globalDedupResult.d_uniquePairs));
+        }
+
         if (trackGpuMemory) {
             timer.addCounter("Profile_GPU_Peak_Used_Bytes", peakGpuMemoryBytes);
+            if (run == 0) {
+                recordOverlapPeakMemoryStats(workerResults, timer);
+            }
         }
 
         if (trackHashContention) {

@@ -80,4 +80,3 @@ void GeometryUploader::freeInternal() {
     num_indices_ = 0;
     num_triangle_to_object_ = 0;
 }
-

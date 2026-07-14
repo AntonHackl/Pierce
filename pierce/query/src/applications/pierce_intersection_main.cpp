@@ -13,12 +13,14 @@
 #include <limits>
 #include <cmath>
 #include <chrono>
+#include <iomanip>
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <memory>
 #include "../optix/OptixContext.h"
 #include "../optix/OptixAccelerationStructure.h"
 #include "GeometryUploader.h"
@@ -111,6 +113,66 @@ struct IntersectionExecutionConfig {
     std::string containmentHitHistogramOutputPath;
 };
 
+struct HashQueryTimingStats {
+    long long clearHashUs = 0;
+    long long overlapMesh1ToMesh2Us = 0;
+    long long overlapMesh2ToMesh1Us = 0;
+    long long containmentMesh1ToMesh2Us = 0;
+    long long containmentMesh2ToMesh1Us = 0;
+    long long resultBufferAllocUs = 0;
+    long long compactHashTableUs = 0;
+    long long hashFailureCopyUs = 0;
+};
+
+struct IntersectionWorkerTimingStats {
+    long long totalUs = 0;
+    long long setDeviceUs = 0;
+    long long contextCreateUs = 0;
+    long long uploadMesh1Us = 0;
+    long long uploadMesh2Us = 0;
+    long long buildMesh1AsUs = 0;
+    long long buildMesh2AsUs = 0;
+    long long uploadMesh1EdgesUs = 0;
+    long long uploadMesh2EdgesUs = 0;
+    long long allocHashAndProfilingUs = 0;
+    long long uploadObjectMetadataUs = 0;
+    long long allocAnyhitBuffersUs = 0;
+    long long allocOptionalDiagnosticsUs = 0;
+    long long warmupTotalUs = 0;
+    long long measuredHashQueryTotalUs = 0;
+    HashQueryTimingStats measuredHashQuery;
+    long long downloadPairsUs = 0;
+    long long overflowDownloadUs = 0;
+    long long fingerprintDownloadUs = 0;
+    long long hitHistogramDownloadUs = 0;
+    long long profilingStatsDownloadUs = 0;
+    long long cleanupUs = 0;
+};
+
+struct IntersectionGpuWorkerRuntime {
+    int deviceId = 0;
+    long long setDeviceUs = 0;
+    long long contextCreateUs = 0;
+    std::unique_ptr<OptixContext> context;
+    std::unique_ptr<MeshIntersectionLauncher> launcher;
+
+    IntersectionGpuWorkerRuntime(int device, const std::string& ptxPath)
+        : deviceId(device) {
+        auto phaseStart = std::chrono::high_resolution_clock::now();
+        CUDA_CHECK(cudaSetDevice(deviceId));
+        setDeviceUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - phaseStart
+        ).count();
+
+        phaseStart = std::chrono::high_resolution_clock::now();
+        context = std::make_unique<OptixContext>();
+        launcher = std::make_unique<MeshIntersectionLauncher>(*context, ptxPath);
+        contextCreateUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - phaseStart
+        ).count();
+    }
+};
+
 struct ContainmentFingerprintRow {
     int slabIndex = 0;
     int direction = 0;
@@ -126,7 +188,9 @@ struct ContainmentFingerprintRow {
 };
 
 struct IntersectionGpuWorkerResult {
-    std::vector<MeshQueryResult> pairs;
+    MeshQueryResult* dPairs = nullptr;
+    long long numPairs = 0;
+    int deviceId = 0;
     std::vector<ContainmentFingerprintRow> containmentFingerprints;
     std::vector<unsigned long long> mesh1ToMesh2HitHistogram;
     std::vector<unsigned long long> mesh2ToMesh1HitHistogram;
@@ -134,6 +198,7 @@ struct IntersectionGpuWorkerResult {
     MeshIntersectionProfilingStats profilingStats = {};
     unsigned long long hashInsertFailures = 0;
     unsigned long long peakMemoryBytes = 0;
+    IntersectionWorkerTimingStats timing;
     int slabIndex = 0;
 };
 
@@ -223,12 +288,19 @@ QueryResults executeHashQuery(
     QueryDirection queryDirection,
     GpuMemoryTracker* memoryTracker = nullptr,
     PerformanceTimer* timer = nullptr,
-    bool verbose = true
+    bool verbose = true,
+    HashQueryTimingStats* timingStats = nullptr
 ) {
     // Clear hash table (set to 0xFF which is our sentinel for empty)
+    auto phaseStart = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaMemset(d_hash_table, 0xFF, hash_table_size * sizeof(unsigned long long)));
     if (params1.hash_insert_failure_counter) {
         CUDA_CHECK(cudaMemset(params1.hash_insert_failure_counter, 0, sizeof(unsigned long long)));
+    }
+    if (timingStats) {
+        timingStats->clearHashUs += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - phaseStart
+        ).count();
     }
     
     params1.use_hash_table = true;
@@ -249,10 +321,14 @@ QueryResults executeHashQuery(
         t0 = std::chrono::high_resolution_clock::now();
         intersectionLauncher.launchOverlapMesh1ToMesh2(params1, mesh1NumEdges);
         t1 = std::chrono::high_resolution_clock::now();
+        const long long elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (timingStats) {
+            timingStats->overlapMesh1ToMesh2Us += elapsedUs;
+        }
         if (timer) {
             timer->addMeasurement(
                 "Raytrace_Overlap_Hash_Mesh1ToMesh2",
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+                elapsedUs
             );
         }
     }
@@ -261,10 +337,14 @@ QueryResults executeHashQuery(
         t0 = std::chrono::high_resolution_clock::now();
         intersectionLauncher.launchOverlapMesh2ToMesh1(params2, mesh2NumEdges);
         t1 = std::chrono::high_resolution_clock::now();
+        const long long elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (timingStats) {
+            timingStats->overlapMesh2ToMesh1Us += elapsedUs;
+        }
         if (timer) {
             timer->addMeasurement(
                 "Raytrace_Overlap_Hash_Mesh2ToMesh1",
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+                elapsedUs
             );
         }
     }
@@ -273,10 +353,14 @@ QueryResults executeHashQuery(
         t0 = std::chrono::high_resolution_clock::now();
         intersectionLauncher.launchContainmentMesh1ToMesh2(params1, mesh1NumObjects);
         t1 = std::chrono::high_resolution_clock::now();
+        const long long elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (timingStats) {
+            timingStats->containmentMesh1ToMesh2Us += elapsedUs;
+        }
         if (timer) {
             timer->addMeasurement(
                 "Raytrace_Containment_Hash_Mesh1ToMesh2",
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+                elapsedUs
             );
         }
     }
@@ -285,10 +369,14 @@ QueryResults executeHashQuery(
         t0 = std::chrono::high_resolution_clock::now();
         intersectionLauncher.launchContainmentMesh2ToMesh1(params2, mesh2NumObjects);
         t1 = std::chrono::high_resolution_clock::now();
+        const long long elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (timingStats) {
+            timingStats->containmentMesh2ToMesh1Us += elapsedUs;
+        }
         if (timer) {
             timer->addMeasurement(
                 "Raytrace_Containment_Hash_Mesh2ToMesh1",
-                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+                elapsedUs
             );
         }
     }
@@ -296,7 +384,13 @@ QueryResults executeHashQuery(
     int max_output = hash_table_size; 
 
     MeshQueryResult* d_merged_results = nullptr;
+    phaseStart = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaMalloc(&d_merged_results, max_output * sizeof(MeshQueryResult)));
+    if (timingStats) {
+        timingStats->resultBufferAllocUs += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - phaseStart
+        ).count();
+    }
     if (memoryTracker) {
         memoryTracker->sample("intersection_after_result_buffer_alloc");
     }
@@ -304,10 +398,14 @@ QueryResults executeHashQuery(
     auto t_dedup_start = std::chrono::high_resolution_clock::now();
     int numUnique = compact_hash_table_pairs(d_hash_table, hash_table_size, d_merged_results, max_output);
     auto t_dedup_end = std::chrono::high_resolution_clock::now();
+    const long long compactUs = std::chrono::duration_cast<std::chrono::microseconds>(t_dedup_end - t_dedup_start).count();
+    if (timingStats) {
+        timingStats->compactHashTableUs += compactUs;
+    }
     if (timer) {
         timer->addMeasurement(
             "compact_hash_table_pairs",
-            std::chrono::duration_cast<std::chrono::microseconds>(t_dedup_end - t_dedup_start).count()
+            compactUs
         );
     }
     
@@ -317,12 +415,18 @@ QueryResults executeHashQuery(
 
     unsigned long long hashInsertFailures = 0;
     if (params1.hash_insert_failure_counter) {
+        phaseStart = std::chrono::high_resolution_clock::now();
         CUDA_CHECK(cudaMemcpy(
             &hashInsertFailures,
             params1.hash_insert_failure_counter,
             sizeof(unsigned long long),
             cudaMemcpyDeviceToHost
         ));
+        if (timingStats) {
+            timingStats->hashFailureCopyUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - phaseStart
+            ).count();
+        }
     }
 
     return {d_merged_results, numUnique, hashInsertFailures};
@@ -353,30 +457,54 @@ static MeshIntersectionProfilingStats combineProfilingStats(
 static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     int deviceId,
     const SlabGeometryPair& slabPair,
-    const IntersectionExecutionConfig& config
+    const IntersectionExecutionConfig& config,
+    IntersectionGpuWorkerRuntime& runtime
 ) {
+    IntersectionWorkerTimingStats workerTiming;
+    const auto workerStart = std::chrono::high_resolution_clock::now();
+    auto phaseStart = workerStart;
+    auto elapsedSince = [](std::chrono::high_resolution_clock::time_point start) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start
+        ).count();
+    };
+
+    phaseStart = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaSetDevice(deviceId));
+    workerTiming.setDeviceUs += elapsedSince(phaseStart);
 
     GpuMemoryTracker memoryTracker(config.trackGpuMemory);
-    OptixContext context;
-    MeshIntersectionLauncher intersectionLauncher(context, config.ptxPath);
+    OptixContext& context = *runtime.context;
+    MeshIntersectionLauncher& intersectionLauncher = *runtime.launcher;
 
     GeometryUploader mesh1Uploader;
+    phaseStart = std::chrono::high_resolution_clock::now();
     mesh1Uploader.upload(slabPair.mesh1.geometry);
     memoryTracker.sample("intersection_after_upload_mesh1");
+    workerTiming.uploadMesh1Us += elapsedSince(phaseStart);
 
     GeometryUploader mesh2Uploader;
+    phaseStart = std::chrono::high_resolution_clock::now();
     mesh2Uploader.upload(slabPair.mesh2.geometry);
     memoryTracker.sample("intersection_after_upload_mesh2");
+    workerTiming.uploadMesh2Us += elapsedSince(phaseStart);
 
     OptixAccelerationStructure mesh1AS(context, mesh1Uploader);
+    phaseStart = std::chrono::high_resolution_clock::now();
     mesh1AS.build(&memoryTracker, "build_mesh1_gas");
+    workerTiming.buildMesh1AsUs += elapsedSince(phaseStart);
 
     OptixAccelerationStructure mesh2AS(context, mesh2Uploader);
+    phaseStart = std::chrono::high_resolution_clock::now();
     mesh2AS.build(&memoryTracker, "build_mesh2_gas");
+    workerTiming.buildMesh2AsUs += elapsedSince(phaseStart);
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     EdgeMeshData mesh1EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh1.geometry);
+    workerTiming.uploadMesh1EdgesUs += elapsedSince(phaseStart);
+    phaseStart = std::chrono::high_resolution_clock::now();
     EdgeMeshData mesh2EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh2.geometry);
+    workerTiming.uploadMesh2EdgesUs += elapsedSince(phaseStart);
 
     const int mesh1NumTriangles = static_cast<int>(mesh1Uploader.getNumIndices());
     const int mesh2NumTriangles = static_cast<int>(mesh2Uploader.getNumIndices());
@@ -386,6 +514,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     const int mesh2NumObjects = static_cast<int>(slabPair.mesh2.localObjectToGlobalObject.size());
 
     unsigned long long* d_hash_table = nullptr;
+    phaseStart = std::chrono::high_resolution_clock::now();
     CUDA_CHECK(cudaMalloc(&d_hash_table, static_cast<size_t>(slabPair.hashTableSize) * sizeof(unsigned long long)));
     memoryTracker.sample("intersection_after_hash_table_alloc");
 
@@ -397,6 +526,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         CUDA_CHECK(cudaMalloc(&d_profiling_stats, sizeof(MeshIntersectionProfilingStats)));
         CUDA_CHECK(cudaMemset(d_profiling_stats, 0, sizeof(MeshIntersectionProfilingStats)));
     }
+    workerTiming.allocHashAndProfilingUs += elapsedSince(phaseStart);
 
     int* d_first_triangle_mesh1 = nullptr;
     int* d_first_triangle_mesh2 = nullptr;
@@ -405,6 +535,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     float3* d_launch_points_mesh1 = nullptr;
     float3* d_launch_points_mesh2 = nullptr;
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     if (mesh1NumObjects > 0) {
         CUDA_CHECK(cudaMalloc(&d_first_triangle_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(
@@ -452,6 +583,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
             cudaMemcpyHostToDevice
         ));
     }
+    workerTiming.uploadObjectMetadataUs += elapsedSince(phaseStart);
 
     int* d_anyhit_candidate_object_ids_mesh1 = nullptr;
     unsigned int* d_anyhit_candidate_parity_mesh1 = nullptr;
@@ -496,6 +628,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         CUDA_CHECK(cudaMalloc(&d_candidateOverflow, static_cast<size_t>(sourceObjects) * sizeof(unsigned int)));
     };
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     allocateAnyhitBuffers(
         mesh1NumObjects,
         d_anyhit_candidate_object_ids_mesh1,
@@ -513,6 +646,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         d_anyhit_candidate_overflow_mesh2
     );
     memoryTracker.sample("intersection_after_anyhit_buffers_alloc");
+    workerTiming.allocAnyhitBuffersUs += elapsedSince(phaseStart);
 
     const bool enableContainmentFingerprints = !config.containmentFingerprintOutputPath.empty();
     auto allocateFingerprintBuffers = [&](int sourceObjects,
@@ -539,6 +673,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         CUDA_CHECK(cudaMemset(d_sums, 0, static_cast<size_t>(sourceObjects) * sizeof(unsigned long long)));
     };
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     allocateFingerprintBuffers(
         mesh1NumObjects,
         d_fingerprint_odd_count_mesh1,
@@ -568,6 +703,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         CUDA_CHECK(cudaMemset(d_hit_histogram_mesh2, 0, static_cast<size_t>(hitHistogramBuckets) * sizeof(unsigned long long)));
     }
     memoryTracker.sample("intersection_after_hit_histogram_alloc");
+    workerTiming.allocOptionalDiagnosticsUs += elapsedSince(phaseStart);
 
     MeshIntersectionLaunchParams params1{};
     params1.mesh1_vertices = mesh1Uploader.getVertices();
@@ -653,6 +789,7 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     params2.containment_hit_histogram_max_bucket = kContainmentHitHistogramMaxBucket;
     params2.containment_hit_histogram = d_hit_histogram_mesh2;
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     for (int warmup = 0; warmup < config.warmupRuns; ++warmup) {
         QueryResults warmupResults = executeHashQuery(
             intersectionLauncher,
@@ -667,13 +804,17 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
             config.queryDirection,
             nullptr,
             nullptr,
-            false
+            false,
+            nullptr
         );
         if (warmupResults.d_merged_results) {
             CUDA_CHECK(cudaFree(warmupResults.d_merged_results));
         }
     }
+    workerTiming.warmupTotalUs += elapsedSince(phaseStart);
 
+    HashQueryTimingStats measuredHashTiming;
+    phaseStart = std::chrono::high_resolution_clock::now();
     QueryResults results = executeHashQuery(
         intersectionLauncher,
         params1,
@@ -687,23 +828,24 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
         config.queryDirection,
         &memoryTracker,
         nullptr,
-        false
+        false,
+        &measuredHashTiming
     );
+    workerTiming.measuredHashQueryTotalUs += elapsedSince(phaseStart);
+    workerTiming.measuredHashQuery = measuredHashTiming;
 
     IntersectionGpuWorkerResult workerResult;
     workerResult.slabIndex = slabPair.slabIndex;
+    workerResult.deviceId = deviceId;
     if (results.numUnique > 0) {
-        workerResult.pairs.resize(results.numUnique);
-        CUDA_CHECK(cudaMemcpy(
-            workerResult.pairs.data(),
-            results.d_merged_results,
-            static_cast<size_t>(results.numUnique) * sizeof(MeshQueryResult),
-            cudaMemcpyDeviceToHost
-        ));
+        workerResult.dPairs = results.d_merged_results;
+        workerResult.numPairs = results.numUnique;
+        results.d_merged_results = nullptr;
     }
     workerResult.hashInsertFailures = results.hashInsertFailures;
 
     if (config.trackOverflow) {
+        phaseStart = std::chrono::high_resolution_clock::now();
         std::vector<unsigned int> mesh1CandidateCounts(mesh1NumObjects, 0);
         std::vector<unsigned int> mesh1OverflowEvents(mesh1NumObjects, 0);
         std::vector<unsigned int> mesh2CandidateCounts(mesh2NumObjects, 0);
@@ -724,9 +866,11 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
             mesh2CandidateCounts,
             mesh2OverflowEvents
         );
+        workerTiming.overflowDownloadUs += elapsedSince(phaseStart);
     }
 
     if (enableContainmentFingerprints) {
+        phaseStart = std::chrono::high_resolution_clock::now();
         const bool recordMesh1ToMesh2 =
             (config.queryDirection == QueryDirection::Both || config.queryDirection == QueryDirection::Mesh1ToMesh2);
         const bool recordMesh2ToMesh1 =
@@ -815,9 +959,11 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
                 d_fingerprint_sum_mesh2
             );
         }
+        workerTiming.fingerprintDownloadUs += elapsedSince(phaseStart);
     }
 
     if (enableHitHistogram) {
+        phaseStart = std::chrono::high_resolution_clock::now();
         const bool recordMesh1ToMesh2 =
             (config.queryDirection == QueryDirection::Both || config.queryDirection == QueryDirection::Mesh1ToMesh2);
         const bool recordMesh2ToMesh1 =
@@ -841,14 +987,18 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
                 cudaMemcpyDeviceToHost
             ));
         }
+        workerTiming.hitHistogramDownloadUs += elapsedSince(phaseStart);
     }
 
     if (config.enableProfilingStats && d_profiling_stats) {
+        phaseStart = std::chrono::high_resolution_clock::now();
         CUDA_CHECK(cudaMemcpy(&workerResult.profilingStats, d_profiling_stats, sizeof(MeshIntersectionProfilingStats), cudaMemcpyDeviceToHost));
+        workerTiming.profilingStatsDownloadUs += elapsedSince(phaseStart);
     }
 
     workerResult.peakMemoryBytes = memoryTracker.getPeakUsedBytes();
 
+    phaseStart = std::chrono::high_resolution_clock::now();
     if (d_profiling_stats) CUDA_CHECK(cudaFree(d_profiling_stats));
     if (results.d_merged_results) CUDA_CHECK(cudaFree(results.d_merged_results));
     if (d_hash_insert_failures) CUDA_CHECK(cudaFree(d_hash_insert_failures));
@@ -888,38 +1038,211 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     PrecomputedEdgeData::freeEdgeData(mesh2EdgeData);
     mesh1Uploader.free();
     mesh2Uploader.free();
+    workerTiming.cleanupUs += elapsedSince(phaseStart);
+    workerTiming.totalUs = elapsedSince(workerStart);
+    workerResult.timing = workerTiming;
 
     return workerResult;
 }
 
-static std::vector<MeshQueryResult> mergeAndDeduplicateHostPairs(
-    const std::vector<IntersectionGpuWorkerResult>& workerResults
+static void printAndRecordSlabMemoryStats(
+    const std::vector<SlabGeometryPair>& slabPairs,
+    PerformanceTimer& timer
 ) {
-    std::unordered_set<unsigned long long> seen;
-    size_t totalPairs = 0;
-    for (const auto& worker : workerResults) {
-        totalPairs += worker.pairs.size();
-    }
-    seen.reserve(totalPairs);
+    const std::vector<SlabMemoryStats> memoryStats = computeSlabMemoryStats(slabPairs);
+    unsigned long long totalPlannedBytes = 0;
+    unsigned long long minPlannedBytes = std::numeric_limits<unsigned long long>::max();
+    unsigned long long maxPlannedBytes = 0;
 
-    std::vector<MeshQueryResult> mergedPairs;
-    mergedPairs.reserve(totalPairs);
-    for (const auto& worker : workerResults) {
-        for (const MeshQueryResult& pair : worker.pairs) {
-            const unsigned long long key = packIntersectionPairKey(pair.object_id_mesh1, pair.object_id_mesh2);
-            if (seen.insert(key).second) {
-                mergedPairs.push_back(pair);
-            }
-        }
+    for (const SlabMemoryStats& stats : memoryStats) {
+        totalPlannedBytes += stats.totalPlannedBytes;
+        minPlannedBytes = std::min(minPlannedBytes, stats.totalPlannedBytes);
+        maxPlannedBytes = std::max(maxPlannedBytes, stats.totalPlannedBytes);
+    }
+    if (memoryStats.empty()) {
+        minPlannedBytes = 0;
+    }
+    const unsigned long long avgPlannedBytes = memoryStats.empty()
+        ? 0
+        : totalPlannedBytes / static_cast<unsigned long long>(memoryStats.size());
+    const unsigned long long maxAvgRatioX1000 = avgPlannedBytes > 0
+        ? (maxPlannedBytes * 1000ULL) / avgPlannedBytes
+        : 0;
+
+    const std::ios::fmtflags oldFlags = std::cout.flags();
+    const std::streamsize oldPrecision = std::cout.precision();
+    std::cout << "\n=== Planned Per-GPU Memory Distribution ===" << std::endl;
+    for (size_t slabOffset = 0; slabOffset < slabPairs.size(); ++slabOffset) {
+        const SlabGeometryPair& slabPair = slabPairs[slabOffset];
+        const SlabMemoryStats& stats = memoryStats[slabOffset];
+        const double pct = totalPlannedBytes > 0
+            ? 100.0 * static_cast<double>(stats.totalPlannedBytes) / static_cast<double>(totalPlannedBytes)
+            : 0.0;
+        std::cout << std::fixed << std::setprecision(2)
+                  << "Slab " << slabPair.slabIndex
+                  << ": mesh1 triangles=" << slabPair.mesh1.numTriangles()
+                  << ", mesh1 edges=" << slabPair.mesh1.numEdges()
+                  << ", mesh2 triangles=" << slabPair.mesh2.numTriangles()
+                  << ", mesh2 edges=" << slabPair.mesh2.numEdges()
+                  << ", estimated_geometry_bytes=" << stats.estimatedGeometryBytes
+                  << ", hash_table_bytes=" << stats.hashTableBytes
+                  << ", total_planned_bytes=" << stats.totalPlannedBytes
+                  << ", planned_pct=" << pct
+                  << ", hash_table_size=" << slabPair.hashTableSize << std::endl;
+
+        const std::string prefix = "Profile_Slab_" + std::to_string(slabPair.slabIndex);
+        timer.addCounter(prefix + "_Mesh1_Triangles", static_cast<unsigned long long>(slabPair.mesh1.numTriangles()));
+        timer.addCounter(prefix + "_Mesh1_Edges", static_cast<unsigned long long>(slabPair.mesh1.numEdges()));
+        timer.addCounter(prefix + "_Mesh2_Triangles", static_cast<unsigned long long>(slabPair.mesh2.numTriangles()));
+        timer.addCounter(prefix + "_Mesh2_Edges", static_cast<unsigned long long>(slabPair.mesh2.numEdges()));
+        timer.addCounter(prefix + "_Estimated_Geometry_Bytes", stats.estimatedGeometryBytes);
+        timer.addCounter(prefix + "_Hash_Table_Bytes", stats.hashTableBytes);
+        timer.addCounter(prefix + "_Total_Planned_Bytes", stats.totalPlannedBytes);
+        timer.addCounter(prefix + "_Planned_Pct_x1000", static_cast<unsigned long long>(pct * 1000.0));
+    }
+    std::cout.flags(oldFlags);
+    std::cout.precision(oldPrecision);
+
+    timer.addCounter("Profile_Planned_Memory_Min_Bytes", minPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Max_Bytes", maxPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Avg_Bytes", avgPlannedBytes);
+    timer.addCounter("Profile_Planned_Memory_Max_Avg_Ratio_x1000", maxAvgRatioX1000);
+}
+
+static void recordSlabPlanningTimingStats(
+    const SlabPlanningTimingStats& stats,
+    long long memoryStatsUs,
+    PerformanceTimer& timer
+) {
+    timer.addMeasurement("Plan Detail Boundary CDF", stats.boundaryCdfUs);
+    timer.addMeasurement("Plan Detail Boundary Search", stats.boundarySearchUs);
+    timer.addMeasurement("Plan Detail Mesh1 Launch Points", stats.mesh1LaunchPointsUs);
+    timer.addMeasurement("Plan Detail Mesh2 Launch Points", stats.mesh2LaunchPointsUs);
+    timer.addMeasurement("Plan Detail Mesh1 Owner Assign", stats.mesh1OwnerAssignUs);
+    timer.addMeasurement("Plan Detail Mesh2 Owner Assign", stats.mesh2OwnerAssignUs);
+    timer.addMeasurement("Plan Detail Mesh1 Active Setup", stats.mesh1ActiveSetupUs);
+    timer.addMeasurement("Plan Detail Mesh2 Active Setup", stats.mesh2ActiveSetupUs);
+    timer.addMeasurement("Plan Detail Mesh1 Endpoint Sweep", stats.mesh1EndpointSweepUs);
+    timer.addMeasurement("Plan Detail Mesh2 Endpoint Sweep", stats.mesh2EndpointSweepUs);
+    timer.addMeasurement("Plan Detail Mesh1 Copy Sort", stats.mesh1ActiveCopySortUs);
+    timer.addMeasurement("Plan Detail Mesh2 Copy Sort", stats.mesh2ActiveCopySortUs);
+    timer.addMeasurement("Plan Detail Mesh1 Materialize", stats.mesh1MaterializeUs);
+    timer.addMeasurement("Plan Detail Mesh2 Materialize", stats.mesh2MaterializeUs);
+    timer.addMeasurement("Plan Detail Mesh1 Object Metadata", stats.mesh1ObjectMetadataUs);
+    timer.addMeasurement("Plan Detail Mesh2 Object Metadata", stats.mesh2ObjectMetadataUs);
+    timer.addMeasurement("Plan Detail Pair Assembly", stats.pairAssemblyUs);
+    timer.addMeasurement("Plan Detail Memory Stats", memoryStatsUs);
+}
+
+static void recordIntersectionPeakMemoryStats(
+    const std::vector<IntersectionGpuWorkerResult>& workerResults,
+    PerformanceTimer& timer
+) {
+    unsigned long long totalPeakBytes = 0;
+    unsigned long long minPeakBytes = std::numeric_limits<unsigned long long>::max();
+    unsigned long long maxPeakBytes = 0;
+
+    for (const IntersectionGpuWorkerResult& workerResult : workerResults) {
+        totalPeakBytes += workerResult.peakMemoryBytes;
+        minPeakBytes = std::min(minPeakBytes, workerResult.peakMemoryBytes);
+        maxPeakBytes = std::max(maxPeakBytes, workerResult.peakMemoryBytes);
+        timer.addCounter(
+            "Profile_Slab_" + std::to_string(workerResult.slabIndex) + "_GPU_Peak_Used_Bytes",
+            workerResult.peakMemoryBytes
+        );
+    }
+    if (workerResults.empty()) {
+        minPeakBytes = 0;
     }
 
-    std::sort(mergedPairs.begin(), mergedPairs.end(), [](const MeshQueryResult& lhs, const MeshQueryResult& rhs) {
-        if (lhs.object_id_mesh1 != rhs.object_id_mesh1) {
-            return lhs.object_id_mesh1 < rhs.object_id_mesh1;
-        }
-        return lhs.object_id_mesh2 < rhs.object_id_mesh2;
-    });
-    return mergedPairs;
+    const unsigned long long avgPeakBytes = workerResults.empty()
+        ? 0
+        : totalPeakBytes / static_cast<unsigned long long>(workerResults.size());
+    const unsigned long long maxAvgRatioX1000 = avgPeakBytes > 0
+        ? (maxPeakBytes * 1000ULL) / avgPeakBytes
+        : 0;
+
+    timer.addCounter("Profile_GPU_Peak_Min_Used_Bytes", minPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Max_Used_Bytes", maxPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Avg_Used_Bytes", avgPeakBytes);
+    timer.addCounter("Profile_GPU_Peak_Max_Avg_Ratio_x1000", maxAvgRatioX1000);
+}
+
+static void recordIntersectionWorkerTimingStats(
+    const std::vector<IntersectionGpuWorkerResult>& workerResults,
+    PerformanceTimer& timer
+) {
+    unsigned long long totalWorkerUs = 0;
+    unsigned long long maxWorkerUs = 0;
+    unsigned long long minWorkerUs = std::numeric_limits<unsigned long long>::max();
+
+    std::cout << "\n=== Per-GPU Worker Timing ===" << std::endl;
+    for (const IntersectionGpuWorkerResult& workerResult : workerResults) {
+        const IntersectionWorkerTimingStats& timing = workerResult.timing;
+        const HashQueryTimingStats& hashTiming = timing.measuredHashQuery;
+        const auto totalUs = static_cast<unsigned long long>(timing.totalUs);
+        totalWorkerUs += totalUs;
+        maxWorkerUs = std::max(maxWorkerUs, totalUs);
+        minWorkerUs = std::min(minWorkerUs, totalUs);
+
+        std::cout << "Slab " << workerResult.slabIndex
+                  << ": worker_total_us=" << timing.totalUs
+                  << ", measured_hash_query_us=" << timing.measuredHashQueryTotalUs
+                  << ", warmup_total_us=" << timing.warmupTotalUs
+                  << ", upload_mesh1_us=" << timing.uploadMesh1Us
+                  << ", upload_mesh2_us=" << timing.uploadMesh2Us
+                  << ", build_mesh1_as_us=" << timing.buildMesh1AsUs
+                  << ", build_mesh2_as_us=" << timing.buildMesh2AsUs
+                  << ", download_pairs_us=" << timing.downloadPairsUs
+                  << ", cleanup_us=" << timing.cleanupUs
+                  << std::endl;
+
+        const std::string prefix = "Profile_Slab_" + std::to_string(workerResult.slabIndex) + "_Worker";
+        timer.addCounter(prefix + "_Total_Us", totalUs);
+        timer.addCounter(prefix + "_Set_Device_Us", static_cast<unsigned long long>(timing.setDeviceUs));
+        timer.addCounter(prefix + "_Context_Create_Us", static_cast<unsigned long long>(timing.contextCreateUs));
+        timer.addCounter(prefix + "_Upload_Mesh1_Us", static_cast<unsigned long long>(timing.uploadMesh1Us));
+        timer.addCounter(prefix + "_Upload_Mesh2_Us", static_cast<unsigned long long>(timing.uploadMesh2Us));
+        timer.addCounter(prefix + "_Build_Mesh1_AS_Us", static_cast<unsigned long long>(timing.buildMesh1AsUs));
+        timer.addCounter(prefix + "_Build_Mesh2_AS_Us", static_cast<unsigned long long>(timing.buildMesh2AsUs));
+        timer.addCounter(prefix + "_Upload_Mesh1_Edges_Us", static_cast<unsigned long long>(timing.uploadMesh1EdgesUs));
+        timer.addCounter(prefix + "_Upload_Mesh2_Edges_Us", static_cast<unsigned long long>(timing.uploadMesh2EdgesUs));
+        timer.addCounter(prefix + "_Alloc_Hash_And_Profiling_Us", static_cast<unsigned long long>(timing.allocHashAndProfilingUs));
+        timer.addCounter(prefix + "_Upload_Object_Metadata_Us", static_cast<unsigned long long>(timing.uploadObjectMetadataUs));
+        timer.addCounter(prefix + "_Alloc_Anyhit_Buffers_Us", static_cast<unsigned long long>(timing.allocAnyhitBuffersUs));
+        timer.addCounter(prefix + "_Alloc_Optional_Diagnostics_Us", static_cast<unsigned long long>(timing.allocOptionalDiagnosticsUs));
+        timer.addCounter(prefix + "_Warmup_Total_Us", static_cast<unsigned long long>(timing.warmupTotalUs));
+        timer.addCounter(prefix + "_Measured_Hash_Query_Total_Us", static_cast<unsigned long long>(timing.measuredHashQueryTotalUs));
+        timer.addCounter(prefix + "_Hash_Clear_Us", static_cast<unsigned long long>(hashTiming.clearHashUs));
+        timer.addCounter(prefix + "_Hash_Overlap_Mesh1_To_Mesh2_Us", static_cast<unsigned long long>(hashTiming.overlapMesh1ToMesh2Us));
+        timer.addCounter(prefix + "_Hash_Overlap_Mesh2_To_Mesh1_Us", static_cast<unsigned long long>(hashTiming.overlapMesh2ToMesh1Us));
+        timer.addCounter(prefix + "_Hash_Containment_Mesh1_To_Mesh2_Us", static_cast<unsigned long long>(hashTiming.containmentMesh1ToMesh2Us));
+        timer.addCounter(prefix + "_Hash_Containment_Mesh2_To_Mesh1_Us", static_cast<unsigned long long>(hashTiming.containmentMesh2ToMesh1Us));
+        timer.addCounter(prefix + "_Hash_Result_Buffer_Alloc_Us", static_cast<unsigned long long>(hashTiming.resultBufferAllocUs));
+        timer.addCounter(prefix + "_Hash_Compact_Table_Us", static_cast<unsigned long long>(hashTiming.compactHashTableUs));
+        timer.addCounter(prefix + "_Hash_Failure_Copy_Us", static_cast<unsigned long long>(hashTiming.hashFailureCopyUs));
+        timer.addCounter(prefix + "_Download_Pairs_Us", static_cast<unsigned long long>(timing.downloadPairsUs));
+        timer.addCounter(prefix + "_Overflow_Download_Us", static_cast<unsigned long long>(timing.overflowDownloadUs));
+        timer.addCounter(prefix + "_Fingerprint_Download_Us", static_cast<unsigned long long>(timing.fingerprintDownloadUs));
+        timer.addCounter(prefix + "_Hit_Histogram_Download_Us", static_cast<unsigned long long>(timing.hitHistogramDownloadUs));
+        timer.addCounter(prefix + "_Profiling_Stats_Download_Us", static_cast<unsigned long long>(timing.profilingStatsDownloadUs));
+        timer.addCounter(prefix + "_Cleanup_Us", static_cast<unsigned long long>(timing.cleanupUs));
+    }
+
+    if (workerResults.empty()) {
+        minWorkerUs = 0;
+    }
+    const unsigned long long avgWorkerUs = workerResults.empty()
+        ? 0
+        : totalWorkerUs / static_cast<unsigned long long>(workerResults.size());
+    const unsigned long long maxAvgRatioX1000 = avgWorkerUs > 0
+        ? (maxWorkerUs * 1000ULL) / avgWorkerUs
+        : 0;
+
+    timer.addCounter("Profile_Worker_Total_Min_Us", minWorkerUs);
+    timer.addCounter("Profile_Worker_Total_Max_Us", maxWorkerUs);
+    timer.addCounter("Profile_Worker_Total_Avg_Us", avgWorkerUs);
+    timer.addCounter("Profile_Worker_Total_Max_Avg_Ratio_x1000", maxAvgRatioX1000);
 }
 
 
@@ -1460,17 +1783,16 @@ int main(int argc, char* argv[]) {
                   << " available device(s)." << std::endl;
     }
 
-    const SlabPartitionPlan slabPlan = planSharedXAxisSlabs(mesh1, mesh2, activeGpuCount);
-    std::vector<SlabGeometryPair> slabPairs = buildSlabGeometryPairs(mesh1, mesh2, slabPlan, hash_table_size);
+    SlabPlanningTimingStats slabPlanningTiming;
+    const SlabPartitionPlan slabPlan = planSharedXAxisSlabs(mesh1, mesh2, activeGpuCount, &slabPlanningTiming);
+    std::vector<SlabGeometryPair> slabPairs = buildSlabGeometryPairs(mesh1, mesh2, slabPlan, hash_table_size, &slabPlanningTiming);
 
-    for (const SlabGeometryPair& slabPair : slabPairs) {
-        std::cout << "Slab " << slabPair.slabIndex
-                  << ": mesh1 triangles=" << slabPair.mesh1.geometry.indices.size()
-                  << ", mesh1 edges=" << slabPair.mesh1.geometry.edges.edgeStarts.size()
-                  << ", mesh2 triangles=" << slabPair.mesh2.geometry.indices.size()
-                  << ", mesh2 edges=" << slabPair.mesh2.geometry.edges.edgeStarts.size()
-                  << ", hash_table_size=" << slabPair.hashTableSize << std::endl;
-    }
+    const auto memoryStatsStart = std::chrono::high_resolution_clock::now();
+    printAndRecordSlabMemoryStats(slabPairs, timer);
+    const long long memoryStatsUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - memoryStatsStart
+    ).count();
+    recordSlabPlanningTimingStats(slabPlanningTiming, memoryStatsUs, timer);
 
     IntersectionExecutionConfig executionConfig;
     executionConfig.queryDirection = queryDirection;
@@ -1483,6 +1805,53 @@ int main(int argc, char* argv[]) {
     executionConfig.ptxPath = options.ptxPath;
     executionConfig.containmentFingerprintOutputPath = containmentFingerprintOutputPath;
     executionConfig.containmentHitHistogramOutputPath = containmentHitHistogramOutputPath;
+
+    timer.next("Initialize GPU Workers");
+    std::vector<std::unique_ptr<IntersectionGpuWorkerRuntime>> workerRuntimes(slabPairs.size());
+    std::vector<std::thread> initThreads;
+    std::mutex initErrorMutex;
+    std::string initError;
+    std::atomic<bool> initFailed{false};
+
+    for (size_t workerIndex = 0; workerIndex < slabPairs.size(); ++workerIndex) {
+        initThreads.emplace_back([&, workerIndex]() {
+            try {
+                workerRuntimes[workerIndex] = std::make_unique<IntersectionGpuWorkerRuntime>(
+                    static_cast<int>(workerIndex),
+                    executionConfig.ptxPath
+                );
+            } catch (const std::exception& ex) {
+                initFailed.store(true);
+                std::lock_guard<std::mutex> lock(initErrorMutex);
+                if (initError.empty()) {
+                    std::ostringstream message;
+                    message << "GPU worker runtime " << workerIndex << " initialization failed: " << ex.what();
+                    initError = message.str();
+                }
+            }
+        });
+    }
+
+    for (std::thread& initThread : initThreads) {
+        initThread.join();
+    }
+
+    if (initFailed.load()) {
+        std::cerr << (initError.empty() ? "GPU worker initialization failed." : initError) << std::endl;
+        return 1;
+    }
+
+    std::cout << "\n=== GPU Worker Initialization Timing ===" << std::endl;
+    for (size_t workerIndex = 0; workerIndex < workerRuntimes.size(); ++workerIndex) {
+        const IntersectionGpuWorkerRuntime& runtime = *workerRuntimes[workerIndex];
+        std::cout << "Worker " << workerIndex
+                  << ": set_device_us=" << runtime.setDeviceUs
+                  << ", context_create_us=" << runtime.contextCreateUs
+                  << std::endl;
+        const std::string prefix = "Profile_Worker_" + std::to_string(workerIndex) + "_Init";
+        timer.addCounter(prefix + "_Set_Device_Us", static_cast<unsigned long long>(runtime.setDeviceUs));
+        timer.addCounter(prefix + "_Context_Create_Us", static_cast<unsigned long long>(runtime.contextCreateUs));
+    }
 
     timer.next("Query");
     std::cout << "Running Intersection Query..." << std::endl;
@@ -1499,7 +1868,8 @@ int main(int argc, char* argv[]) {
                 workerResults[workerIndex] = runIntersectionOnCurrentDevice(
                     static_cast<int>(workerIndex),
                     slabPairs[workerIndex],
-                    executionConfig
+                    executionConfig,
+                    *workerRuntimes[workerIndex]
                 );
             } catch (const std::exception& ex) {
                 workerFailed.store(true);
@@ -1522,10 +1892,40 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::vector<MeshQueryResult> h_pairs = mergeAndDeduplicateHostPairs(workerResults);
-    std::cout << "Actual Intersection Pairs: " << h_pairs.size() << std::endl;
-    timer.addCounter("Profile_Actual_Intersection_Pairs", static_cast<unsigned long long>(h_pairs.size()));
+    recordIntersectionWorkerTimingStats(workerResults, timer);
+
+    std::vector<DevicePairBuffer> workerBuffers;
+    workerBuffers.reserve(workerResults.size());
+    for (const auto& workerResult : workerResults) {
+        workerBuffers.push_back({workerResult.deviceId, workerResult.dPairs, workerResult.numPairs});
+    }
+
+    const auto globalDedupStart = std::chrono::high_resolution_clock::now();
+    GpuGlobalDedupResult globalDedupResult;
+    try {
+        globalDedupResult = gather_and_deduplicate_pairs_gpu(workerBuffers, 0);
+    } catch (const std::exception& ex) {
+        std::cerr << "Global GPU deduplication failed: " << ex.what() << std::endl;
+        return 1;
+    }
+    const long long globalDedupTotalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now() - globalDedupStart
+    ).count();
+
+    std::cout << "Actual Intersection Pairs: " << globalDedupResult.uniqueCount << std::endl;
+    timer.addCounter("Profile_Actual_Intersection_Pairs", static_cast<unsigned long long>(globalDedupResult.uniqueCount));
     timer.addCounter("Profile_Active_GPU_Count", static_cast<unsigned long long>(activeGpuCount));
+    timer.addCounter("Profile_Global_Dedup_Mode", 1ULL);
+    timer.addCounter("Profile_Global_Dedup_Aggregator_Device", static_cast<unsigned long long>(globalDedupResult.aggregatorDeviceId));
+    timer.addCounter("Profile_Global_Dedup_Input_Pairs", static_cast<unsigned long long>(globalDedupResult.inputCount));
+    timer.addCounter("Profile_Global_Dedup_Unique_Pairs", static_cast<unsigned long long>(globalDedupResult.uniqueCount));
+    timer.addCounter("Profile_Global_Dedup_Gather_Us", static_cast<unsigned long long>(globalDedupResult.gatherUs));
+    timer.addCounter("Profile_Global_Dedup_SortUnique_Us", static_cast<unsigned long long>(globalDedupResult.dedupUs));
+    timer.addCounter("Profile_Global_Dedup_Total_Us", static_cast<unsigned long long>(globalDedupTotalUs));
+    timer.addCounter(
+        "Profile_Global_Dedup_Buffer_Bytes",
+        static_cast<unsigned long long>(globalDedupResult.inputCount) * static_cast<unsigned long long>(sizeof(MeshQueryResult))
+    );
 
     unsigned long long aggregateHashInsertFailures = 0;
     for (const auto& workerResult : workerResults) {
@@ -1535,8 +1935,24 @@ int main(int argc, char* argv[]) {
     timer.addCounter("Profile_Hash_Insert_Failures", aggregateHashInsertFailures);
 
     if (exportResults) {
+        std::vector<MeshQueryResult> h_pairs;
+        if (globalDedupResult.uniqueCount > 0) {
+            h_pairs.resize(static_cast<size_t>(globalDedupResult.uniqueCount));
+            CUDA_CHECK(cudaSetDevice(globalDedupResult.aggregatorDeviceId));
+            CUDA_CHECK(cudaMemcpy(
+                h_pairs.data(),
+                globalDedupResult.d_uniquePairs,
+                static_cast<size_t>(globalDedupResult.uniqueCount) * sizeof(MeshQueryResult),
+                cudaMemcpyDeviceToHost
+            ));
+        }
         writeIntersectionPairsCsv(pairsOutputPath, h_pairs);
         std::cout << "Intersection pairs CSV: " << pairsOutputPath << std::endl;
+    }
+
+    if (globalDedupResult.d_uniquePairs) {
+        CUDA_CHECK(cudaSetDevice(globalDedupResult.aggregatorDeviceId));
+        CUDA_CHECK(cudaFree(globalDedupResult.d_uniquePairs));
     }
 
     if (!containmentFingerprintOutputPath.empty()) {
@@ -1604,6 +2020,7 @@ int main(int argc, char* argv[]) {
             peakMemoryBytes = std::max(peakMemoryBytes, workerResult.peakMemoryBytes);
         }
         timer.addCounter("Profile_GPU_Peak_Used_Bytes", peakMemoryBytes);
+        recordIntersectionPeakMemoryStats(workerResults, timer);
         std::cout << "Peak GPU memory across workers: " << peakMemoryBytes << " bytes" << std::endl;
     }
 

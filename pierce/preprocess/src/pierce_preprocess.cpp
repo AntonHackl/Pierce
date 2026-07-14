@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
+#include <utility>
 // #include "Geometry.h"
 #include "../../common/include/Geometry.h"
 #include "../../common/include/BinaryIO.h"
@@ -172,17 +173,78 @@ enum class DatasetMode { MESH, DT };
 namespace {
 
 void fillSortedOrder(
-    const std::vector<float>& centers,
+    const std::vector<float>& values,
     std::vector<uint32_t>& order
 ) {
-    order.resize(centers.size());
+    order.resize(values.size());
     std::iota(order.begin(), order.end(), 0U);
     std::sort(order.begin(), order.end(), [&](uint32_t lhs, uint32_t rhs) {
-        if (centers[lhs] != centers[rhs]) {
-            return centers[lhs] < centers[rhs];
+        if (values[lhs] != values[rhs]) {
+            return values[lhs] < values[rhs];
         }
         return lhs < rhs;
     });
+}
+
+size_t histogramBinForCenter(float center, const PartitionWeightSummary& summary) {
+    const size_t binCount = summary.binWeights.size();
+    if (binCount <= 1 || summary.centerMaxX <= summary.centerMinX) {
+        return 0;
+    }
+
+    const double t = static_cast<double>(center - summary.centerMinX) /
+        static_cast<double>(summary.centerMaxX - summary.centerMinX);
+    if (t <= 0.0) {
+        return 0;
+    }
+    if (t >= 1.0) {
+        return binCount - 1;
+    }
+    return std::min(binCount - 1, static_cast<size_t>(t * static_cast<double>(binCount)));
+}
+
+void computePartitionWeightSummary(GeometryData& geometry) {
+    PartitionWeightSummary summary;
+    summary.binWeights.assign(DEFAULT_PARTITION_WEIGHT_HISTOGRAM_BINS, 0.0);
+
+    if (geometry.partition.triangles.size() == 0 ||
+        (geometry.partition.triangles.size() + geometry.partition.edges.size()) == 0) {
+        geometry.partition.weightSummary = std::move(summary);
+        return;
+    }
+
+    summary.triangleMinX = *std::min_element(
+        geometry.partition.triangles.mins.begin(),
+        geometry.partition.triangles.mins.end()
+    );
+    summary.triangleMaxX = *std::max_element(
+        geometry.partition.triangles.maxs.begin(),
+        geometry.partition.triangles.maxs.end()
+    );
+    summary.centerMinX = std::numeric_limits<float>::max();
+    summary.centerMaxX = std::numeric_limits<float>::lowest();
+
+    for (float center : geometry.partition.triangles.centers) {
+        summary.centerMinX = std::min(summary.centerMinX, center);
+        summary.centerMaxX = std::max(summary.centerMaxX, center);
+    }
+    for (float center : geometry.partition.edges.centers) {
+        summary.centerMinX = std::min(summary.centerMinX, center);
+        summary.centerMaxX = std::max(summary.centerMaxX, center);
+    }
+
+    for (float center : geometry.partition.triangles.centers) {
+        const size_t bin = histogramBinForCenter(center, summary);
+        summary.binWeights[bin] += PARTITION_TRIANGLE_WEIGHT_BYTES;
+        summary.totalWeight += PARTITION_TRIANGLE_WEIGHT_BYTES;
+    }
+    for (float center : geometry.partition.edges.centers) {
+        const size_t bin = histogramBinForCenter(center, summary);
+        summary.binWeights[bin] += PARTITION_EDGE_WEIGHT_BYTES;
+        summary.totalWeight += PARTITION_EDGE_WEIGHT_BYTES;
+    }
+
+    geometry.partition.weightSummary = std::move(summary);
 }
 
 void computePartitionMetadata(GeometryData& geometry) {
@@ -246,9 +308,11 @@ void computePartitionMetadata(GeometryData& geometry) {
         geometry.partition.edges.centers[edgeIdx] = (edgeMinX + edgeMaxX) * 0.5f;
     }
 
-    fillSortedOrder(geometry.partition.triangles.centers, geometry.partition.triangleSortedByCenter);
-    fillSortedOrder(geometry.partition.edges.centers, geometry.partition.edgeSortedByCenter);
-    fillSortedOrder(geometry.partition.objects.centers, geometry.partition.objectSortedByCenter);
+    fillSortedOrder(geometry.partition.triangles.mins, geometry.partition.triangleSortedByMin);
+    fillSortedOrder(geometry.partition.triangles.maxs, geometry.partition.triangleSortedByMax);
+    fillSortedOrder(geometry.partition.edges.mins, geometry.partition.edgeSortedByMin);
+    fillSortedOrder(geometry.partition.edges.maxs, geometry.partition.edgeSortedByMax);
+    computePartitionWeightSummary(geometry);
 }
 
 } // namespace

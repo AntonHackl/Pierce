@@ -43,9 +43,14 @@ Usage: ./build_all.sh [--clean] [--only COMPONENT] [--jobs N]
 
 Components: preprocess, query, face, tdbase, generators
 
+By default, existing build directories are reused and CMake/Make rebuild only
+what is out of date. Pass --clean to delete the selected build directory first
+and configure from scratch.
+
 Use either a comma-separated list or repeat --only, for example:
   ./build_all.sh --only preprocess,query
   ./build_all.sh --only preprocess --only query
+  ./build_all.sh --clean --only query
 
 The script activates an existing component-specific Conda environment.
 Create the environments from their YAML files before the first build.
@@ -143,11 +148,13 @@ build_cmake() (
         )
     fi
 
+    local configure_args=()
     if $CLEAN; then
         rm -rf "$build_dir"
+        configure_args+=(--fresh)
     fi
 
-    cmake -S "$source_dir" -B "$build_dir" --fresh \
+    cmake -S "$source_dir" -B "$build_dir" "${configure_args[@]}" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         "${cmake_args[@]}"
     cmake --build "$build_dir" --parallel "$JOBS"

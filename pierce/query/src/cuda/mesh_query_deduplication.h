@@ -2,6 +2,27 @@
 
 #include "common.h"
 #include <cuda_runtime.h>
+#include <vector>
+
+struct DevicePairBuffer {
+    int deviceId = 0;
+    MeshQueryResult* d_pairs = nullptr;
+    long long count = 0;
+};
+
+struct GpuGlobalDedupResult {
+    int aggregatorDeviceId = 0;
+    MeshQueryResult* d_uniquePairs = nullptr;
+    long long inputCount = 0;
+    long long uniqueCount = 0;
+    long long gatherUs = 0;
+    long long dedupUs = 0;
+};
+
+GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
+    const std::vector<DevicePairBuffer>& worker_buffers,
+    int aggregator_device_id
+);
 
 extern "C" {
 long long merge_and_deduplicate_pairs_gpu(

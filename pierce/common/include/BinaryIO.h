@@ -9,7 +9,7 @@ namespace RaySpace {
 namespace IO {
 
 constexpr uint32_t BINARY_FILE_MAGIC = 0x52334442; // "R3DB"
-constexpr uint32_t BINARY_FILE_VERSION = 5;
+constexpr uint32_t BINARY_FILE_VERSION = 7;
 
 struct FileHeader {
     uint32_t magic;
@@ -94,13 +94,27 @@ inline bool writeBinaryFile(const std::string& filename, const GeometryData& geo
                 out.write(reinterpret_cast<const char*>(order.data()), order.size() * sizeof(uint32_t));
             }
         };
+        const auto writeWeightSummary = [&](const PartitionWeightSummary& summary) {
+            const uint32_t binCount = static_cast<uint32_t>(summary.binWeights.size());
+            out.write(reinterpret_cast<const char*>(&summary.triangleMinX), sizeof(float));
+            out.write(reinterpret_cast<const char*>(&summary.triangleMaxX), sizeof(float));
+            out.write(reinterpret_cast<const char*>(&summary.centerMinX), sizeof(float));
+            out.write(reinterpret_cast<const char*>(&summary.centerMaxX), sizeof(float));
+            out.write(reinterpret_cast<const char*>(&summary.totalWeight), sizeof(double));
+            out.write(reinterpret_cast<const char*>(&binCount), sizeof(uint32_t));
+            if (binCount > 0) {
+                out.write(reinterpret_cast<const char*>(summary.binWeights.data()), binCount * sizeof(double));
+            }
+        };
 
         writeAxisIntervalData(geometry.partition.triangles);
         writeAxisIntervalData(geometry.partition.edges);
         writeAxisIntervalData(geometry.partition.objects);
-        writeOrder(geometry.partition.triangleSortedByCenter);
-        writeOrder(geometry.partition.edgeSortedByCenter);
-        writeOrder(geometry.partition.objectSortedByCenter);
+        writeOrder(geometry.partition.triangleSortedByMin);
+        writeOrder(geometry.partition.triangleSortedByMax);
+        writeOrder(geometry.partition.edgeSortedByMin);
+        writeOrder(geometry.partition.edgeSortedByMax);
+        writeWeightSummary(geometry.partition.weightSummary);
     }
 
     out.close();
@@ -128,7 +142,8 @@ inline GeometryData readBinaryFile(const std::string& filename) {
     if (header.version != BINARY_FILE_VERSION) {
         std::cerr << "Error: Unsupported binary geometry version " << header.version
                   << " in file: " << filename
-                  << ". Expected version " << BINARY_FILE_VERSION << ". Re-run preprocessing." << std::endl;
+                  << ". Expected version " << BINARY_FILE_VERSION
+                  << ". Re-run pierce_preprocess to regenerate partition summaries." << std::endl;
         return geometry;
     }
 
@@ -189,13 +204,28 @@ inline GeometryData readBinaryFile(const std::string& filename) {
                 in.read(reinterpret_cast<char*>(order.data()), count * sizeof(uint32_t));
             }
         };
+        auto readWeightSummary = [&](PartitionWeightSummary& summary) {
+            uint32_t binCount = 0;
+            in.read(reinterpret_cast<char*>(&summary.triangleMinX), sizeof(float));
+            in.read(reinterpret_cast<char*>(&summary.triangleMaxX), sizeof(float));
+            in.read(reinterpret_cast<char*>(&summary.centerMinX), sizeof(float));
+            in.read(reinterpret_cast<char*>(&summary.centerMaxX), sizeof(float));
+            in.read(reinterpret_cast<char*>(&summary.totalWeight), sizeof(double));
+            in.read(reinterpret_cast<char*>(&binCount), sizeof(uint32_t));
+            summary.binWeights.resize(binCount);
+            if (binCount > 0) {
+                in.read(reinterpret_cast<char*>(summary.binWeights.data()), binCount * sizeof(double));
+            }
+        };
 
         readAxisIntervalData(geometry.partition.triangles, header.numIndices);
         readAxisIntervalData(geometry.partition.edges, header.numEdges);
         readAxisIntervalData(geometry.partition.objects, header.numObjects);
-        readOrder(geometry.partition.triangleSortedByCenter, header.numIndices);
-        readOrder(geometry.partition.edgeSortedByCenter, header.numEdges);
-        readOrder(geometry.partition.objectSortedByCenter, header.numObjects);
+        readOrder(geometry.partition.triangleSortedByMin, header.numIndices);
+        readOrder(geometry.partition.triangleSortedByMax, header.numIndices);
+        readOrder(geometry.partition.edgeSortedByMin, header.numEdges);
+        readOrder(geometry.partition.edgeSortedByMax, header.numEdges);
+        readWeightSummary(geometry.partition.weightSummary);
     }
 
     in.close();
