@@ -42,7 +42,9 @@ void OptixAccelerationStructure::buildInternal() {
     buildInput.triangleArray.numIndexTriplets = static_cast<unsigned int>(geometry_.getNumIndices());
     buildInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
     buildInput.triangleArray.indexStrideInBytes = sizeof(uint3);
-    unsigned int triangle_input_flags = OPTIX_GEOMETRY_FLAG_DISABLE_TRIANGLE_FACE_CULLING;
+    unsigned int triangle_input_flags =
+        OPTIX_GEOMETRY_FLAG_DISABLE_TRIANGLE_FACE_CULLING |
+        OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL;
     buildInput.triangleArray.flags = &triangle_input_flags;
     buildInput.triangleArray.numSbtRecords = 1;
     

@@ -27,6 +27,7 @@ void writeGeometryDataToFile(const GeometryData& geometry, const std::string& fi
 
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 
 struct ObjectStats {
     float3 minB = {1e30f, 1e30f, 1e30f};
@@ -167,6 +168,90 @@ void generateGridStats(GeometryData& geometry, GridData& grid, float cellSize) {
 }
 
 enum class DatasetMode { MESH, DT };
+
+namespace {
+
+void fillSortedOrder(
+    const std::vector<float>& centers,
+    std::vector<uint32_t>& order
+) {
+    order.resize(centers.size());
+    std::iota(order.begin(), order.end(), 0U);
+    std::sort(order.begin(), order.end(), [&](uint32_t lhs, uint32_t rhs) {
+        if (centers[lhs] != centers[rhs]) {
+            return centers[lhs] < centers[rhs];
+        }
+        return lhs < rhs;
+    });
+}
+
+void computePartitionMetadata(GeometryData& geometry) {
+    const size_t numTriangles = geometry.indices.size();
+    const size_t numEdges = geometry.edges.edgeStarts.size();
+
+    geometry.partition.triangles.mins.resize(numTriangles);
+    geometry.partition.triangles.maxs.resize(numTriangles);
+    geometry.partition.triangles.centers.resize(numTriangles);
+
+    int maxObjectId = -1;
+    for (int objectId : geometry.triangleToObject) {
+        if (objectId > maxObjectId) {
+            maxObjectId = objectId;
+        }
+    }
+
+    const size_t numObjects = (maxObjectId >= 0) ? static_cast<size_t>(maxObjectId + 1) : 0;
+    geometry.partition.objects.mins.assign(numObjects, std::numeric_limits<float>::max());
+    geometry.partition.objects.maxs.assign(numObjects, std::numeric_limits<float>::lowest());
+    geometry.partition.objects.centers.assign(numObjects, 0.0f);
+
+    for (size_t triIdx = 0; triIdx < numTriangles; ++triIdx) {
+        const uint3 tri = geometry.indices[triIdx];
+        const float3& v0 = geometry.vertices[tri.x];
+        const float3& v1 = geometry.vertices[tri.y];
+        const float3& v2 = geometry.vertices[tri.z];
+
+        const float triMinX = std::min({v0.x, v1.x, v2.x});
+        const float triMaxX = std::max({v0.x, v1.x, v2.x});
+        geometry.partition.triangles.mins[triIdx] = triMinX;
+        geometry.partition.triangles.maxs[triIdx] = triMaxX;
+        geometry.partition.triangles.centers[triIdx] = (triMinX + triMaxX) * 0.5f;
+
+        const int objectId = geometry.triangleToObject[triIdx];
+        if (objectId >= 0 && static_cast<size_t>(objectId) < numObjects) {
+            geometry.partition.objects.mins[objectId] = std::min(geometry.partition.objects.mins[objectId], triMinX);
+            geometry.partition.objects.maxs[objectId] = std::max(geometry.partition.objects.maxs[objectId], triMaxX);
+        }
+    }
+
+    for (size_t objectId = 0; objectId < numObjects; ++objectId) {
+        if (geometry.partition.objects.mins[objectId] == std::numeric_limits<float>::max()) {
+            geometry.partition.objects.mins[objectId] = 0.0f;
+            geometry.partition.objects.maxs[objectId] = 0.0f;
+        }
+        geometry.partition.objects.centers[objectId] =
+            (geometry.partition.objects.mins[objectId] + geometry.partition.objects.maxs[objectId]) * 0.5f;
+    }
+
+    geometry.partition.edges.mins.resize(numEdges);
+    geometry.partition.edges.maxs.resize(numEdges);
+    geometry.partition.edges.centers.resize(numEdges);
+    for (size_t edgeIdx = 0; edgeIdx < numEdges; ++edgeIdx) {
+        const float3& start = geometry.edges.edgeStarts[edgeIdx];
+        const float3& end = geometry.edges.edgeEnds[edgeIdx];
+        const float edgeMinX = std::min(start.x, end.x);
+        const float edgeMaxX = std::max(start.x, end.x);
+        geometry.partition.edges.mins[edgeIdx] = edgeMinX;
+        geometry.partition.edges.maxs[edgeIdx] = edgeMaxX;
+        geometry.partition.edges.centers[edgeIdx] = (edgeMinX + edgeMaxX) * 0.5f;
+    }
+
+    fillSortedOrder(geometry.partition.triangles.centers, geometry.partition.triangleSortedByCenter);
+    fillSortedOrder(geometry.partition.edges.centers, geometry.partition.edgeSortedByCenter);
+    fillSortedOrder(geometry.partition.objects.centers, geometry.partition.objectSortedByCenter);
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     std::string datasetPath = "";
@@ -326,6 +411,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "Extracted " << geometry.edges.numEdges() << " unique edges (per object)" << std::endl;
+
+    timer.next("Computing Partition Metadata");
+    computePartitionMetadata(geometry);
+    if (!geometry.partition.hasData()) {
+        std::cerr << "Error: Failed to compute partition metadata." << std::endl;
+        return 1;
+    }
 
     // Write geometry data
     timer.next("Writing Geometry Data");

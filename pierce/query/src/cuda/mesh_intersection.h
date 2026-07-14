@@ -19,6 +19,7 @@ struct MeshIntersectionProfilingStats {
     unsigned long long containment_candidate_toggles;
     unsigned long long containment_candidate_overflow;
     unsigned long long containment_targets_total;
+    unsigned long long hash_insert_failures;
 };
 
 struct MeshIntersectionLaunchParams {
@@ -46,9 +47,12 @@ struct MeshIntersectionLaunchParams {
     unsigned long long* hash_table;
     int hash_table_size;
     int use_hash_table; // Use int instead of bool
+    unsigned long long* hash_insert_failure_counter;
     
     // Exactly one launch triangle per source object for containment.
     int* first_triangle_index_per_object;
+    int* source_object_ids_by_launch_index;
+    float3* launch_points_per_object;
     
     // Two-pass results (legacy)
     int* collision_counts;
@@ -81,4 +85,18 @@ struct MeshIntersectionLaunchParams {
     unsigned int* anyhit_candidate_hit_counts;
     unsigned int* anyhit_candidate_count_per_source;
     unsigned int* anyhit_candidate_overflow_per_source;
+
+    // Optional per-source containment candidate fingerprints.
+    int enable_containment_fingerprints;
+    unsigned int* containment_fingerprint_odd_candidate_count_per_source;
+    unsigned long long* containment_fingerprint_hit_total_per_source;
+    unsigned long long* containment_fingerprint_target_xor_per_source;
+    unsigned long long* containment_fingerprint_target_sum_per_source;
+    unsigned long long* containment_fingerprint_xor_per_source;
+    unsigned long long* containment_fingerprint_sum_per_source;
+
+    // Optional containment candidate hit-count histogram.
+    int enable_containment_hit_histogram;
+    int containment_hit_histogram_max_bucket;
+    unsigned long long* containment_hit_histogram;
 };

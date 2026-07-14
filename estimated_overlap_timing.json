@@ -1,0 +1,39 @@
+{
+  "phases": {
+    "load mesh1_1": {
+      "duration_us": 3465842,
+      "duration_ms": 3465.84
+    },
+    "load mesh2_1": {
+      "duration_us": 3169178,
+      "duration_ms": 3169.18
+    },
+    "selectivity estimation_1": {
+      "duration_us": 3,
+      "duration_ms": 0.00
+    },
+    "plan shared slabs_1": {
+      "duration_us": 40262057,
+      "duration_ms": 40262.06
+    },
+    "execute hash query_1": {
+      "duration_us": 972210,
+      "duration_ms": 972.21
+    },
+    "download results_1": {
+      "duration_us": 1479963,
+      "duration_ms": 1479.96
+    },
+    "cleanup_1": {
+      "duration_us": 5728653,
+      "duration_ms": 5728.65
+    }
+  },
+  "counters": {
+    "profile_active_gpu_count": 2
+  },
+  "total": {
+    "duration_us": 55077914,
+    "duration_ms": 55077.91
+  }
+}

@@ -100,6 +100,10 @@ set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # CUDA Sources
 set(CUDA_DIR ${SRC_DIR}/cuda)
 set(CUDA_SOURCES ${CUDA_DIR}/mesh_overlap_edges.cu ${CUDA_DIR}/mesh_intersection.cu ${CUDA_DIR}/mesh_intersection_anyhit.cu)
+file(GLOB CUDA_HEADER_DEPENDENCIES
+    ${CUDA_DIR}/*.h
+    ${CUDA_DIR}/*.cuh
+)
 set(RESULT_COMPACTION_SOURCE ${CUDA_DIR}/result_compaction.cu)
 set(MESH_QUERY_DEDUP_SOURCE ${CUDA_DIR}/mesh_query_deduplication.cu)
 set(SCAN_UTILS_SOURCE ${CUDA_DIR}/scan_utils.cu)
@@ -134,7 +138,8 @@ set(RAYTRACING_SOURCES
 
 # Runtime sources
 set(RUNTIME_SOURCES
-    ${SRC_DIR}/runtime/GeometryIO.cpp)
+    ${SRC_DIR}/runtime/GeometryIO.cpp
+    ${SRC_DIR}/runtime/MultiGpuPartitioning.cpp)
 
 set(UTILITY_SOURCES
     ${SRC_DIR}/utilities/GpuMemoryTracker.cpp)
@@ -151,6 +156,7 @@ set(OPTIX_PROGRAM_TARGET "--ptx")
 
 NVCUDA_COMPILE_MODULE(
     SOURCES       ${CUDA_SOURCES} ${MESH_CONTAINMENT_SOURCE}
+    DEPENDENCIES  ${CUDA_HEADER_DEPENDENCIES}
     TARGET_PATH   ${PTX_OUTPUT_DIR}
     EXTENSION     "${OPTIX_MODULE_EXTENSION}"
     GENERATED_FILES PTX_FILES

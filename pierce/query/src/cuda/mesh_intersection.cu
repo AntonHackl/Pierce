@@ -132,6 +132,13 @@ __device__ void insert_hash_table(int id1, int id2) {
         
         h = (h + 1) % size;
     }
+
+    if (mesh_intersection_params.hash_insert_failure_counter) {
+        atomicAdd(mesh_intersection_params.hash_insert_failure_counter, 1ULL);
+    }
+    if (mesh_intersection_params.profiling_enabled && mesh_intersection_params.profiling_stats) {
+        atomicAdd(&mesh_intersection_params.profiling_stats->hash_insert_failures, 1ULL);
+    }
 }
 
 extern "C" __global__ void __raygen__mesh_overlap() {

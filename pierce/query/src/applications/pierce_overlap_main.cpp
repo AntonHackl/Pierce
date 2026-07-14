@@ -14,13 +14,18 @@
 #include <chrono>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <iomanip>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <cuda_runtime.h>
 #include "../optix/OptixContext.h"
 #include "../optix/OptixAccelerationStructure.h"
 #include "GeometryUploader.h"
 #include "Geometry.h"
 #include "GeometryIO.h"
+#include "MultiGpuPartitioning.h"
 #include "../cuda/mesh_query_deduplication.h"
 #include "scan_utils.h"
 #include "common.h"
@@ -45,6 +50,30 @@ enum class QueryDirection {
     Both,
     Mesh1ToMesh2,
     Mesh2ToMesh1
+};
+
+static unsigned long long packOverlapPairKey(int mesh1ObjectId, int mesh2ObjectId) {
+    return (static_cast<unsigned long long>(static_cast<unsigned int>(mesh1ObjectId)) << 32) |
+        static_cast<unsigned long long>(static_cast<unsigned int>(mesh2ObjectId));
+}
+
+struct OverlapExecutionConfig {
+    QueryDirection direction = QueryDirection::Both;
+    bool trackHashContention = false;
+    int overlapMaxIterations = 100;
+    bool trackGpuMemory = false;
+    int warmupRuns = 0;
+    std::string ptxPath;
+};
+
+struct OverlapGpuWorkerResult {
+    std::vector<MeshQueryResult> pairs;
+    unsigned long long hashAccesses = 0;
+    unsigned long long hashContentions = 0;
+    unsigned long long hashTableSize = 0;
+    unsigned long long resultBufferCapacity = 0;
+    unsigned long long peakMemoryBytes = 0;
+    int slabIndex = 0;
 };
 
 static const char* directionToString(QueryDirection direction) {
@@ -207,6 +236,168 @@ QueryResults executeHashQuery(
     return {d_merged_results, numUnique, hashAccesses, hashContentions, static_cast<unsigned long long>(max_output)};
 }
 
+static OverlapGpuWorkerResult runOverlapOnCurrentDevice(
+    int deviceId,
+    const SlabGeometryPair& slabPair,
+    const OverlapExecutionConfig& config
+) {
+    CUDA_CHECK(cudaSetDevice(deviceId));
+
+    GpuMemoryTracker memoryTracker(config.trackGpuMemory);
+    OptixContext context;
+
+    GeometryUploader mesh1Uploader;
+    mesh1Uploader.upload(slabPair.mesh1.geometry);
+    memoryTracker.sample("overlap_after_upload_mesh1");
+
+    GeometryUploader mesh2Uploader;
+    mesh2Uploader.upload(slabPair.mesh2.geometry);
+    memoryTracker.sample("overlap_after_upload_mesh2");
+
+    OptixAccelerationStructure mesh1AS(context, mesh1Uploader);
+    mesh1AS.build(&memoryTracker, "build_mesh1_gas");
+
+    OptixAccelerationStructure mesh2AS(context, mesh2Uploader);
+    mesh2AS.build(&memoryTracker, "build_mesh2_gas");
+    memoryTracker.sample("overlap_after_build_mesh2_index", true);
+
+    EdgeMeshData mesh1EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh1.geometry);
+    EdgeMeshData mesh2EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh2.geometry);
+    const int mesh1NumEdges = mesh1EdgeData.num_edges;
+    const int mesh2NumEdges = mesh2EdgeData.num_edges;
+    const int mesh1NumTriangles = static_cast<int>(mesh1Uploader.getNumIndices());
+    const int mesh2NumTriangles = static_cast<int>(mesh2Uploader.getNumIndices());
+    (void)mesh1NumTriangles;
+    (void)mesh2NumTriangles;
+
+    MeshOverlapEdgesLauncher edgesLauncher(context, config.ptxPath);
+
+    MeshOverlapEdgesLaunchParams edgesParams1 = {};
+    edgesParams1.edge_starts = mesh1EdgeData.d_edge_starts;
+    edgesParams1.edge_ends = mesh1EdgeData.d_edge_ends;
+    edgesParams1.edge_source_object_ids = mesh1EdgeData.d_source_object_ids;
+    edgesParams1.num_edges = mesh1NumEdges;
+    edgesParams1.mesh2_handle = mesh2AS.getHandle();
+    edgesParams1.mesh2_vertices = mesh2Uploader.getVertices();
+    edgesParams1.mesh2_indices = mesh2Uploader.getIndices();
+    edgesParams1.mesh2_triangle_to_object = mesh2Uploader.getTriangleToObject();
+    edgesParams1.swap_pair_order = 0;
+    edgesParams1.overlap_max_iterations = config.overlapMaxIterations;
+
+    MeshOverlapEdgesLaunchParams edgesParams2 = {};
+    edgesParams2.edge_starts = mesh2EdgeData.d_edge_starts;
+    edgesParams2.edge_ends = mesh2EdgeData.d_edge_ends;
+    edgesParams2.edge_source_object_ids = mesh2EdgeData.d_source_object_ids;
+    edgesParams2.num_edges = mesh2NumEdges;
+    edgesParams2.mesh2_handle = mesh1AS.getHandle();
+    edgesParams2.mesh2_vertices = mesh1Uploader.getVertices();
+    edgesParams2.mesh2_indices = mesh1Uploader.getIndices();
+    edgesParams2.mesh2_triangle_to_object = mesh1Uploader.getTriangleToObject();
+    edgesParams2.swap_pair_order = 1;
+    edgesParams2.overlap_max_iterations = config.overlapMaxIterations;
+
+    for (int warmup = 0; warmup < config.warmupRuns; ++warmup) {
+        unsigned long long* dWarmupHashTable = nullptr;
+        CUDA_CHECK(cudaMalloc(&dWarmupHashTable, slabPair.hashTableSize * sizeof(unsigned long long)));
+        QueryResults warmupResults = executeHashQuery(
+            edgesLauncher,
+            edgesParams1,
+            edgesParams2,
+            mesh1NumEdges,
+            mesh2NumEdges,
+            dWarmupHashTable,
+            slabPair.hashTableSize,
+            0,
+            config.direction,
+            nullptr,
+            nullptr,
+            false,
+            false
+        );
+        if (warmupResults.d_merged_results) {
+            CUDA_CHECK(cudaFree(warmupResults.d_merged_results));
+        }
+        CUDA_CHECK(cudaFree(dWarmupHashTable));
+    }
+
+    unsigned long long* dHashTable = nullptr;
+    CUDA_CHECK(cudaMalloc(&dHashTable, slabPair.hashTableSize * sizeof(unsigned long long)));
+    memoryTracker.sample("overlap_after_hash_table_alloc");
+
+    QueryResults queryResults = executeHashQuery(
+        edgesLauncher,
+        edgesParams1,
+        edgesParams2,
+        mesh1NumEdges,
+        mesh2NumEdges,
+        dHashTable,
+        slabPair.hashTableSize,
+        0,
+        config.direction,
+        &memoryTracker,
+        nullptr,
+        false,
+        config.trackHashContention
+    );
+
+    OverlapGpuWorkerResult workerResult;
+    workerResult.slabIndex = slabPair.slabIndex;
+    workerResult.hashAccesses = queryResults.hashAccesses;
+    workerResult.hashContentions = queryResults.hashContentions;
+    workerResult.hashTableSize = slabPair.hashTableSize;
+    workerResult.resultBufferCapacity = queryResults.resultBufferCapacity;
+    workerResult.peakMemoryBytes = memoryTracker.getPeakUsedBytes();
+
+    if (queryResults.numUnique > 0) {
+        workerResult.pairs.resize(queryResults.numUnique);
+        CUDA_CHECK(cudaMemcpy(
+            workerResult.pairs.data(),
+            queryResults.d_merged_results,
+            static_cast<size_t>(queryResults.numUnique) * sizeof(MeshQueryResult),
+            cudaMemcpyDeviceToHost
+        ));
+    }
+
+    if (queryResults.d_merged_results) CUDA_CHECK(cudaFree(queryResults.d_merged_results));
+    if (dHashTable) CUDA_CHECK(cudaFree(dHashTable));
+    PrecomputedEdgeData::freeEdgeData(mesh1EdgeData);
+    PrecomputedEdgeData::freeEdgeData(mesh2EdgeData);
+    mesh1Uploader.free();
+    mesh2Uploader.free();
+
+    return workerResult;
+}
+
+static std::vector<MeshQueryResult> mergeAndDeduplicateOverlapPairs(
+    const std::vector<OverlapGpuWorkerResult>& workerResults
+) {
+    std::unordered_set<unsigned long long> seen;
+    size_t totalPairs = 0;
+    for (const auto& workerResult : workerResults) {
+        totalPairs += workerResult.pairs.size();
+    }
+    seen.reserve(totalPairs);
+
+    std::vector<MeshQueryResult> mergedPairs;
+    mergedPairs.reserve(totalPairs);
+    for (const auto& workerResult : workerResults) {
+        for (const MeshQueryResult& pair : workerResult.pairs) {
+            const unsigned long long key = packOverlapPairKey(pair.object_id_mesh1, pair.object_id_mesh2);
+            if (seen.insert(key).second) {
+                mergedPairs.push_back(pair);
+            }
+        }
+    }
+
+    std::sort(mergedPairs.begin(), mergedPairs.end(), [](const MeshQueryResult& lhs, const MeshQueryResult& rhs) {
+        if (lhs.object_id_mesh1 != rhs.object_id_mesh1) {
+            return lhs.object_id_mesh1 < rhs.object_id_mesh1;
+        }
+        return lhs.object_id_mesh2 < rhs.object_id_mesh2;
+    });
+    return mergedPairs;
+}
+
 // Helper to calculate global average size of objects from grid statistics
 float calculateGlobalAvgSize(const std::vector<SparseGridEntry>& sparseCells) {
     double totalSize = 0.0;
@@ -254,6 +445,7 @@ public:
     float hashTableFreeMemFraction = 0.0f;
     int overlapMaxIterations = 100;
     bool trackGpuMemory = false;
+    int numGpus = 1;
 
     bool valid = true;
 
@@ -271,6 +463,7 @@ public:
         options.emplace_back("--hash-table-free-mem-fraction <f>", "Use f in (0,1] of free GPU memory for hash table sizing");
         options.emplace_back("--overlap-max-iterations <int>", "Overlap ray iteration cap (default: 100)");
         options.emplace_back("--track-gpu-memory", "Track GPU memory checkpoints and peak usage");
+        options.emplace_back("--num-gpus <int>", "Number of GPUs / shared x-slabs to use (default: 1)");
         options.emplace_back("--estimate-only", "Only run selectivity estimation, skip actual query");
         appendHelpFlag(options);
 
@@ -333,6 +526,10 @@ protected:
             trackGpuMemory = true;
             return true;
         }
+        if (arg == "--num-gpus" && i + 1 < argc) {
+            numGpus = std::stoi(argv[++i]);
+            return true;
+        }
         return false;
     }
 };
@@ -369,8 +566,7 @@ int main(int argc, char* argv[]) {
     const float hashTableFreeMemFraction = options.hashTableFreeMemFraction;
     const int overlapMaxIterations = options.overlapMaxIterations;
     const bool trackGpuMemory = options.trackGpuMemory;
-
-    GpuMemoryTracker memoryTracker(trackGpuMemory);
+    const int requestedNumGpus = options.numGpus;
 
     if (!options.hasRequiredMeshInputs()) {
         std::cerr << "Usage: " << argv[0] << " --mesh1 <path> --mesh2 <path> [options]" << std::endl;
@@ -379,6 +575,10 @@ int main(int argc, char* argv[]) {
 
     if (hashTableFreeMemFraction < 0.0f || hashTableFreeMemFraction > 1.0f) {
         std::cerr << "Error: --hash-table-free-mem-fraction must be in [0, 1]." << std::endl;
+        return 1;
+    }
+    if (requestedNumGpus <= 0) {
+        std::cerr << "Error: --num-gpus must be > 0." << std::endl;
         return 1;
     }
     
@@ -391,6 +591,10 @@ int main(int argc, char* argv[]) {
     if (!requirePrecomputedEdges(mesh1, mesh1Path, "Mesh1")) {
         return 1;
     }
+    if (!mesh1.partition.hasData()) {
+        std::cerr << "Error: Mesh1 does not contain partition metadata. Re-run pierce_preprocess." << std::endl;
+        return 1;
+    }
     
     timer.next("Load Mesh2");
     GeometryData mesh2 = loadGeometryFromFile(mesh2Path);
@@ -400,6 +604,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (!requirePrecomputedEdges(mesh2, mesh2Path, "Mesh2")) {
+        return 1;
+    }
+    if (!mesh2.partition.hasData()) {
+        std::cerr << "Error: Mesh2 does not contain partition metadata. Re-run pierce_preprocess." << std::endl;
         return 1;
     }
 
@@ -538,6 +746,7 @@ int main(int argc, char* argv[]) {
             : computeHashTableSize(estimatedPairs);
         std::cout << "\n=== Selectivity Estimation (Overlap - Direct) ===" << std::endl;
         std::cout << "Final Estimated Pairs:     " << estimatedPairs << std::endl;
+        std::cout << "Requested GPUs:            " << requestedNumGpus << std::endl;
         if (manualHashTableSize > 0) {
             std::cout << "Using Manual Hash Table Size: " << hash_table_size << std::endl;
         } else if (hashTableFreeMemFraction > 0.0f) {
@@ -551,101 +760,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // --- EXECUTION PHASE ---
-    timer.next("Init OptiX");
-    OptixContext context;
-
-    timer.next("Upload Mesh1");
-    GeometryUploader mesh1Uploader;
-    mesh1Uploader.upload(mesh1);
-    memoryTracker.sample("overlap_after_upload_mesh1");
-
-    timer.next("Upload Mesh2");
-    GeometryUploader mesh2Uploader;
-    mesh2Uploader.upload(mesh2);
-    memoryTracker.sample("overlap_after_upload_mesh2");
-
-    timer.next("Build Mesh1 Index");
-    OptixAccelerationStructure mesh1AS(context, mesh1Uploader);
-    mesh1AS.build(&memoryTracker, "build_mesh1_gas");
-
-    timer.next("Build Mesh2 Index");
-    OptixAccelerationStructure mesh2AS(context, mesh2Uploader);
-    mesh2AS.build(&memoryTracker, "build_mesh2_gas");
-    memoryTracker.sample("overlap_after_build_mesh2_index", true);
-
-    timer.next("Upload Mesh1 Edges");
-    EdgeMeshData mesh1EdgeData = PrecomputedEdgeData::uploadFromGeometry(mesh1);
-    int mesh1NumEdges = mesh1EdgeData.num_edges;
-    std::cout << "Mesh1 edges uploaded: " << mesh1NumEdges << " unique edges" << std::endl;
-    memoryTracker.sample("overlap_after_mesh1_edges_upload");
-
-    timer.next("Upload Mesh2 Edges");
-    EdgeMeshData mesh2EdgeData = PrecomputedEdgeData::uploadFromGeometry(mesh2);
-    int mesh2NumEdges = mesh2EdgeData.num_edges;
-    std::cout << "Mesh2 edges uploaded: " << mesh2NumEdges << " unique edges" << std::endl;
-    memoryTracker.sample("overlap_after_mesh2_edges_upload");
-
-    timer.next("Create Edge Launcher");
-    MeshOverlapEdgesLauncher edgesLauncher(context, options.ptxPath);
-
-    timer.next("Prepare Kernel Parameters");
-    int mesh1NumTriangles = static_cast<int>(mesh1Uploader.getNumIndices());
-    int mesh2NumTriangles = static_cast<int>(mesh2Uploader.getNumIndices());
-
-    MeshOverlapEdgesLaunchParams edgesParams1 = {};
-    edgesParams1.edge_starts = mesh1EdgeData.d_edge_starts;
-    edgesParams1.edge_ends = mesh1EdgeData.d_edge_ends;
-    edgesParams1.edge_source_object_ids = mesh1EdgeData.d_source_object_ids;
-    edgesParams1.num_edges = mesh1NumEdges;
-    edgesParams1.mesh2_handle = mesh2AS.getHandle();
-    edgesParams1.mesh2_vertices = mesh2Uploader.getVertices();
-    edgesParams1.mesh2_indices = (uint3*)mesh2Uploader.getIndices();
-    edgesParams1.mesh2_triangle_to_object = mesh2Uploader.getTriangleToObject();
-    edgesParams1.swap_pair_order = 0;
-    edgesParams1.overlap_max_iterations = overlapMaxIterations;
-
-    MeshOverlapEdgesLaunchParams edgesParams2 = {};
-    edgesParams2.edge_starts = mesh2EdgeData.d_edge_starts;
-    edgesParams2.edge_ends = mesh2EdgeData.d_edge_ends;
-    edgesParams2.edge_source_object_ids = mesh2EdgeData.d_source_object_ids;
-    edgesParams2.num_edges = mesh2NumEdges;
-    edgesParams2.mesh2_handle = mesh1AS.getHandle();
-    edgesParams2.mesh2_vertices = mesh1Uploader.getVertices();
-    edgesParams2.mesh2_indices = (uint3*)mesh1Uploader.getIndices();
-    edgesParams2.mesh2_triangle_to_object = mesh1Uploader.getTriangleToObject();
-    edgesParams2.swap_pair_order = 1;
-    edgesParams2.overlap_max_iterations = overlapMaxIterations;
-
-    timer.next("Warmup");
-    if (warmupRuns > 0) {
-        std::cout << "Running " << warmupRuns << " warmup iterations (estimation + hash query)..." << std::endl;
-        for (int warmup = 0; warmup < warmupRuns; ++warmup) {
-            long long warmupEstimatedPairs = estimatePairs(false);
-            unsigned long long warmupHashSize = computeHashTableSize(warmupEstimatedPairs);
-            unsigned long long* d_warmup_hash_table = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_warmup_hash_table, warmupHashSize * sizeof(unsigned long long)));
-
-            QueryResults warmupResults = executeHashQuery(
-                edgesLauncher,
-                edgesParams1,
-                edgesParams2,
-                mesh1NumEdges,
-                mesh2NumEdges,
-                d_warmup_hash_table,
-                warmupHashSize,
-                warmupEstimatedPairs,
-                queryDirection,
-                nullptr,
-                nullptr,
-                false,
-                false
-            );
-
-            if (warmupResults.d_merged_results) CUDA_CHECK(cudaFree(warmupResults.d_merged_results));
-            CUDA_CHECK(cudaFree(d_warmup_hash_table));
-        }
-    }
+    std::cout << "\n=== Overlap Query Configuration ===" << std::endl;
+    std::cout << "Requested GPUs:            " << requestedNumGpus << std::endl;
+    std::cout << "Query direction:           " << directionToString(queryDirection) << std::endl;
+    std::cout << "Overlap max iterations:    " << overlapMaxIterations << std::endl;
+    std::cout << "Track hash contention:     " << (trackHashContention ? "yes" : "no") << std::endl;
+    std::cout << "Track GPU memory:          " << (trackGpuMemory ? "yes" : "no") << std::endl;
+    std::cout << "===============================\n" << std::endl;
 
     int finalNumUnique = 0;
     unsigned long long finalHashAccesses = 0;
@@ -654,17 +775,28 @@ int main(int argc, char* argv[]) {
     unsigned long long finalResultBufferCapacity = 0;
     std::vector<MeshQueryResult> hostResults;
     for (int run = 0; run < numberOfRuns; ++run) {
-        bool verboseRun = (run == 0);
-
         timer.next("Selectivity Estimation");
         long long estimatedPairs = estimatePairs(false);
         unsigned long long hash_table_size = (manualHashTableSize > 0)
             ? manualHashTableSize
             : computeHashTableSize(estimatedPairs);
 
-        timer.next("Execute Hash Query");
+        int availableGpuCount = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&availableGpuCount));
+        if (availableGpuCount <= 0) {
+            std::cerr << "No CUDA devices available." << std::endl;
+            return 1;
+        }
+        const int activeGpuCount = std::min(requestedNumGpus, availableGpuCount);
+        if (run == 0 && activeGpuCount != requestedNumGpus) {
+            std::cout << "Requested " << requestedNumGpus << " GPUs, using " << activeGpuCount
+                      << " available device(s)." << std::endl;
+        }
 
-        if (verboseRun) {
+        timer.next("Plan Shared Slabs");
+        const SlabPartitionPlan slabPlan = planSharedXAxisSlabs(mesh1, mesh2, activeGpuCount);
+        std::vector<SlabGeometryPair> slabPairs = buildSlabGeometryPairs(mesh1, mesh2, slabPlan, static_cast<int>(hash_table_size));
+        if (run == 0) {
             std::cout << "\n=== Selectivity Estimation (Overlap - Direct) ===" << std::endl;
             std::cout << "Final Estimated Pairs:     " << estimatedPairs << std::endl;
             if (manualHashTableSize > 0) {
@@ -674,68 +806,98 @@ int main(int argc, char* argv[]) {
             } else {
                 std::cout << "Using Direct Estimated Hash Table Size: " << hash_table_size << std::endl;
             }
-            std::cout << "Hash Table Allocated Bytes: "
-                      << (hash_table_size * sizeof(unsigned long long)) << std::endl;
+            for (const SlabGeometryPair& slabPair : slabPairs) {
+                std::cout << "Slab " << slabPair.slabIndex
+                          << ": mesh1 triangles=" << slabPair.mesh1.geometry.indices.size()
+                          << ", mesh1 edges=" << slabPair.mesh1.geometry.edges.edgeStarts.size()
+                          << ", mesh2 triangles=" << slabPair.mesh2.geometry.indices.size()
+                          << ", mesh2 edges=" << slabPair.mesh2.geometry.edges.edgeStarts.size()
+                          << ", hash_table_size=" << slabPair.hashTableSize << std::endl;
+            }
         }
 
-        unsigned long long* d_hash_table = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_hash_table, hash_table_size * sizeof(unsigned long long)));
-        memoryTracker.sample("overlap_after_hash_table_alloc");
+        OverlapExecutionConfig executionConfig;
+        executionConfig.direction = queryDirection;
+        executionConfig.trackHashContention = trackHashContention;
+        executionConfig.overlapMaxIterations = overlapMaxIterations;
+        executionConfig.trackGpuMemory = trackGpuMemory;
+        executionConfig.warmupRuns = warmupRuns;
+        executionConfig.ptxPath = options.ptxPath;
 
-        QueryResults queryResults = executeHashQuery(
-            edgesLauncher,
-            edgesParams1,
-            edgesParams2,
-            mesh1NumEdges,
-            mesh2NumEdges,
-            d_hash_table,
-            hash_table_size,
-            estimatedPairs,
-            queryDirection,
-            &memoryTracker,
-            &timer,
-            verboseRun,
-            trackHashContention
-        );
+        timer.next("Execute Hash Query");
+        std::vector<OverlapGpuWorkerResult> workerResults(slabPairs.size());
+        std::vector<std::thread> workerThreads;
+        std::mutex errorMutex;
+        std::string workerError;
+        std::atomic<bool> workerFailed{false};
+
+        for (size_t workerIndex = 0; workerIndex < slabPairs.size(); ++workerIndex) {
+            workerThreads.emplace_back([&, workerIndex]() {
+                try {
+                    workerResults[workerIndex] = runOverlapOnCurrentDevice(
+                        static_cast<int>(workerIndex),
+                        slabPairs[workerIndex],
+                        executionConfig
+                    );
+                } catch (const std::exception& ex) {
+                    workerFailed.store(true);
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (workerError.empty()) {
+                        std::ostringstream message;
+                        message << "GPU worker " << workerIndex << " failed: " << ex.what();
+                        workerError = message.str();
+                    }
+                }
+            });
+        }
+        for (std::thread& workerThread : workerThreads) {
+            workerThread.join();
+        }
+        if (workerFailed.load()) {
+            std::cerr << (workerError.empty() ? "Multi-GPU overlap execution failed." : workerError) << std::endl;
+            return 1;
+        }
 
         timer.next("Download Results");
-        hostResults.clear();
-        if (queryResults.numUnique > 0) {
-            hostResults.resize(queryResults.numUnique);
-            CUDA_CHECK(cudaMemcpy(hostResults.data(), queryResults.d_merged_results,
-                                  (size_t)queryResults.numUnique * sizeof(MeshQueryResult),
-                                  cudaMemcpyDeviceToHost));
+        hostResults = mergeAndDeduplicateOverlapPairs(workerResults);
+        finalNumUnique = static_cast<int>(hostResults.size());
+        finalHashAccesses = 0;
+        finalHashContentions = 0;
+        finalResultBufferCapacity = 0;
+        finalHashTableSize = 0;
+        unsigned long long peakGpuMemoryBytes = 0;
+        for (const auto& workerResult : workerResults) {
+            finalHashAccesses += workerResult.hashAccesses;
+            finalHashContentions += workerResult.hashContentions;
+            finalResultBufferCapacity += workerResult.resultBufferCapacity;
+            finalHashTableSize += workerResult.hashTableSize;
+            peakGpuMemoryBytes = std::max(peakGpuMemoryBytes, workerResult.peakMemoryBytes);
         }
-        finalNumUnique = queryResults.numUnique;
-        finalHashAccesses = queryResults.hashAccesses;
-        finalHashContentions = queryResults.hashContentions;
-        finalHashTableSize = hash_table_size;
-        finalResultBufferCapacity = queryResults.resultBufferCapacity;
+
+        timer.addCounter("Profile_Active_GPU_Count", static_cast<unsigned long long>(activeGpuCount));
+        if (trackGpuMemory) {
+            timer.addCounter("Profile_GPU_Peak_Used_Bytes", peakGpuMemoryBytes);
+        }
 
         if (trackHashContention) {
-            double contentionPct = (queryResults.hashAccesses > 0)
-                ? (100.0 * static_cast<double>(queryResults.hashContentions) / static_cast<double>(queryResults.hashAccesses))
+            double contentionPct = (finalHashAccesses > 0)
+                ? (100.0 * static_cast<double>(finalHashContentions) / static_cast<double>(finalHashAccesses))
                 : 0.0;
             std::cout << std::fixed << std::setprecision(2)
                       << "Hash contention (run " << (run + 1) << "): "
-                      << queryResults.hashContentions << "/" << queryResults.hashAccesses
+                      << finalHashContentions << "/" << finalHashAccesses
                       << " accesses (" << contentionPct << "%)" << std::endl;
             std::cout.unsetf(std::ios::floatfield);
         }
-
-        if (queryResults.d_merged_results) CUDA_CHECK(cudaFree(queryResults.d_merged_results));
-        CUDA_CHECK(cudaFree(d_hash_table));
     }
 
     timer.next("Cleanup");
-
-    PrecomputedEdgeData::freeEdgeData(mesh1EdgeData);
-    PrecomputedEdgeData::freeEdgeData(mesh2EdgeData);
-
     std::set<int> mesh1UniqueObjects(mesh1.triangleToObject.begin(), mesh1.triangleToObject.end());
     int mesh1NumObjects = mesh1UniqueObjects.size();
     std::set<int> mesh2UniqueObjects(mesh2.triangleToObject.begin(), mesh2.triangleToObject.end());
     int mesh2NumObjects = mesh2UniqueObjects.size();
+    int mesh1NumTriangles = static_cast<int>(mesh1.indices.size());
+    int mesh2NumTriangles = static_cast<int>(mesh2.indices.size());
 
     std::cout << "\n=== Mesh Overlap Join Summary ===" << std::endl;
     std::cout << "Mesh1 triangles: " << mesh1NumTriangles << std::endl;
@@ -778,8 +940,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    memoryTracker.addToTimer(timer);
-    memoryTracker.printSummary();
     timer.finish(outputJsonPath);
     
     std::cout << "\nQuery completed in " << (double)timer.getTotalDuration() / 1000.0 << " ms." << std::endl;

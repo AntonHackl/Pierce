@@ -39,6 +39,41 @@ struct EdgeData {
     }
 };
 
+struct AxisIntervalData {
+    std::vector<float> mins;
+    std::vector<float> maxs;
+    std::vector<float> centers;
+
+    bool hasData() const {
+        return !mins.empty() &&
+               mins.size() == maxs.size() &&
+               mins.size() == centers.size();
+    }
+
+    size_t size() const {
+        return centers.size();
+    }
+};
+
+struct PartitionMetadata {
+    AxisIntervalData triangles;
+    AxisIntervalData edges;
+    AxisIntervalData objects;
+
+    std::vector<uint32_t> triangleSortedByCenter;
+    std::vector<uint32_t> edgeSortedByCenter;
+    std::vector<uint32_t> objectSortedByCenter;
+
+    bool hasData() const {
+        return triangles.hasData() &&
+               edges.hasData() &&
+               objects.hasData() &&
+               triangleSortedByCenter.size() == triangles.size() &&
+               edgeSortedByCenter.size() == edges.size() &&
+               objectSortedByCenter.size() == objects.size();
+    }
+};
+
 struct GeometryData {
     std::vector<float3, PinnedAllocator<float3>> vertices;
     std::vector<uint3, PinnedAllocator<uint3>> indices;
@@ -46,6 +81,7 @@ struct GeometryData {
     size_t totalTriangles = 0;
 
     EdgeData edges;
+    PartitionMetadata partition;
     
     GridData grid;
 };

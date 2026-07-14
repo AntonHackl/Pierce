@@ -9,7 +9,7 @@ namespace RaySpace {
 namespace IO {
 
 constexpr uint32_t BINARY_FILE_MAGIC = 0x52334442; // "R3DB"
-constexpr uint32_t BINARY_FILE_VERSION = 4;
+constexpr uint32_t BINARY_FILE_VERSION = 5;
 
 struct FileHeader {
     uint32_t magic;
@@ -18,10 +18,12 @@ struct FileHeader {
     uint64_t numIndices;
     uint64_t numMappings;
     uint64_t numEdges;
+    uint64_t numObjects;
     uint64_t totalTriangles;
     uint8_t hasGrid;
     uint8_t hasEdges;
-    uint8_t padding[6]; // Align to 8 bytes
+    uint8_t hasPartitionMetadata;
+    uint8_t padding[5]; // Align to 8 bytes
 };
 
 struct GridParams {
@@ -43,9 +45,11 @@ inline bool writeBinaryFile(const std::string& filename, const GeometryData& geo
     header.numIndices = geometry.indices.size();
     header.numMappings = geometry.triangleToObject.size();
     header.numEdges = geometry.edges.edgeStarts.size();
+    header.numObjects = geometry.partition.objects.centers.size();
     header.totalTriangles = geometry.totalTriangles;
     header.hasGrid = geometry.grid.hasGrid ? 1 : 0;
     header.hasEdges = geometry.edges.hasEdges() ? 1 : 0;
+    header.hasPartitionMetadata = geometry.partition.hasData() ? 1 : 0;
     
     out.write(reinterpret_cast<const char*>(&header), sizeof(FileHeader));
 
@@ -75,6 +79,28 @@ inline bool writeBinaryFile(const std::string& filename, const GeometryData& geo
 
         if (gp.numSparseCells > 0)
             out.write(reinterpret_cast<const char*>(geometry.grid.sparseCells.data()), gp.numSparseCells * sizeof(SparseGridEntry));
+    }
+
+    if (header.hasPartitionMetadata) {
+        const auto writeAxisIntervalData = [&](const AxisIntervalData& axisData) {
+            if (!axisData.mins.empty()) {
+                out.write(reinterpret_cast<const char*>(axisData.mins.data()), axisData.mins.size() * sizeof(float));
+                out.write(reinterpret_cast<const char*>(axisData.maxs.data()), axisData.maxs.size() * sizeof(float));
+                out.write(reinterpret_cast<const char*>(axisData.centers.data()), axisData.centers.size() * sizeof(float));
+            }
+        };
+        const auto writeOrder = [&](const std::vector<uint32_t>& order) {
+            if (!order.empty()) {
+                out.write(reinterpret_cast<const char*>(order.data()), order.size() * sizeof(uint32_t));
+            }
+        };
+
+        writeAxisIntervalData(geometry.partition.triangles);
+        writeAxisIntervalData(geometry.partition.edges);
+        writeAxisIntervalData(geometry.partition.objects);
+        writeOrder(geometry.partition.triangleSortedByCenter);
+        writeOrder(geometry.partition.edgeSortedByCenter);
+        writeOrder(geometry.partition.objectSortedByCenter);
     }
 
     out.close();
@@ -144,6 +170,32 @@ inline GeometryData readBinaryFile(const std::string& filename) {
         
         if (numSparseCells > 0)
             in.read(reinterpret_cast<char*>(geometry.grid.sparseCells.data()), numSparseCells * sizeof(SparseGridEntry));
+    }
+
+    if (header.hasPartitionMetadata) {
+        auto readAxisIntervalData = [&](AxisIntervalData& axisData, uint64_t count) {
+            axisData.mins.resize(count);
+            axisData.maxs.resize(count);
+            axisData.centers.resize(count);
+            if (count > 0) {
+                in.read(reinterpret_cast<char*>(axisData.mins.data()), count * sizeof(float));
+                in.read(reinterpret_cast<char*>(axisData.maxs.data()), count * sizeof(float));
+                in.read(reinterpret_cast<char*>(axisData.centers.data()), count * sizeof(float));
+            }
+        };
+        auto readOrder = [&](std::vector<uint32_t>& order, uint64_t count) {
+            order.resize(count);
+            if (count > 0) {
+                in.read(reinterpret_cast<char*>(order.data()), count * sizeof(uint32_t));
+            }
+        };
+
+        readAxisIntervalData(geometry.partition.triangles, header.numIndices);
+        readAxisIntervalData(geometry.partition.edges, header.numEdges);
+        readAxisIntervalData(geometry.partition.objects, header.numObjects);
+        readOrder(geometry.partition.triangleSortedByCenter, header.numIndices);
+        readOrder(geometry.partition.edgeSortedByCenter, header.numEdges);
+        readOrder(geometry.partition.objectSortedByCenter, header.numObjects);
     }
 
     in.close();
