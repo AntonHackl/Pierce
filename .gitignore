@@ -8,6 +8,9 @@ build/
 *.ptx
 
 # Benchmark data and generated results
+tmp/
+benchmark_snapshots/
+memories/
 data/
 microns_data/
 benchmarks/data/
@@ -33,3 +36,12 @@ __pycache__/
 *.pre
 *.csv
 !baselines/face/data/cube.obj
+
+# Benchmark fixture meshes needed by mesh-complexity runs
+!benchmarks/overlap/data/
+!benchmarks/overlap/data/single_obj_files/
+!benchmarks/overlap/data/single_obj_files/Sphere_Stage_1.obj
+!benchmarks/overlap/data/single_obj_files/Sphere_Stage_2.obj
+!benchmarks/overlap/data/single_obj_files/Sphere_Stage_3.obj
+!benchmarks/overlap/data/single_obj_files/Sphere_Stage_4.obj
+!benchmarks/overlap/data/single_obj_files/Sphere_Stage_5.obj

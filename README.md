@@ -28,8 +28,32 @@ TDBase must resolve to `5058e2f540438a497cd0592b9044e0bcbd745cbb`.
 
 ## Build
 
-Prerequisites are Linux, CUDA 12.8, NVIDIA OptiX 7.5 or newer, CMake, CGAL,
-Boost, Eigen, OpenMP, GMP, and MPFR. Set `OptiX_INSTALL_DIR` to the OptiX SDK.
+- Ubuntu `24.04.4 LTS` was used for the artifact builds.
+- Conda `26.1.1` was used to create the environments.
+- NVIDIA OptiX SDK `7.5` or newer is required.
+- CUDA `12.8` is installed through the Conda environment files
+  (`cuda-toolkit=12.8`).
+- Export the OptiX SDK path before building:
+
+```bash
+export OptiX_INSTALL_DIR=/path/to/NVIDIA-OptiX-SDK-...
+```
+
+## Quick Setup
+
+- Clone the repository and initialize submodules:
+
+  ```bash
+  git clone --recurse-submodules https://github.com/AntonHackl/Pierce.git
+  cd Pierce
+  git submodule update --init --recursive
+  ```
+
+- Export the OptiX SDK path:
+
+  ```bash
+  export OptiX_INSTALL_DIR=/path/to/NVIDIA-OptiX-SDK-...
+  ```
 
 Create the component environments once:
 
@@ -38,6 +62,7 @@ conda env create -f pierce/preprocess/environment-linux.yml
 conda env create -f pierce/query/environment-linux.yml
 conda env create -f baselines/face/environment.yml
 conda env create -f baselines/tdbase_extensions/environment.yml
+conda env create -f benchmarks/overlap/environment.yml
 ```
 
 The build script activates the appropriate existing environment for each
@@ -46,6 +71,12 @@ component, so it can be invoked directly from the base environment:
 ```bash
 ./build_all.sh
 ./test_all.sh
+```
+
+For benchmark scripts and figure export, activate the benchmark environment:
+
+```bash
+conda activate pierce_benchmarks
 ```
 
 The paper-facing executables are:
