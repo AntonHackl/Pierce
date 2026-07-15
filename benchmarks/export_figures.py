@@ -52,7 +52,7 @@ FIGURES = [
         output_name="mesh_query_comparison_overall_performance.pdf",
         runs_dir=SCRIPT_DIR / "predicates" / "runs",
         run_prefix="query_comparison_overall_performance_",
-        source_pattern="figures/mesh_query_comparison_overall_performance_*.pdf",
+        source_pattern="figures/predicate_comparison_overall_performance_*.pdf",
         revisualize_script=SCRIPT_DIR / "predicates" / "plot_overall_performance.py",
     ),
     FigureSpec(

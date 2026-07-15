@@ -384,7 +384,7 @@ def _plot_grouped_bars(groups: List[GroupResult], output_base: Path) -> None:
     all_vals = [v for g in groups for v in g.approach_to_mean.values()]
     set_log_timing_axis_limits(ax, all_vals, floor=1.0)
     _, current_top = ax.get_ylim()
-    ax.set_ylim(top=current_top * 3.0)
+    ax.set_ylim(top=current_top * 4.0)
     ax.set_ylabel("Query Time (ms)", fontsize=17)
     ax.set_xticks(x)
     ax.set_xticklabels(
