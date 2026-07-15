@@ -9,6 +9,7 @@
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -381,6 +382,152 @@ static bool sanitize_off_for_tdbase(
     return true;
 }
 
+struct ObjVertex {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+static bool parse_obj_face_vertex(const string& token, long long& index) {
+    const size_t slash = token.find('/');
+    const string raw = token.substr(0, slash);
+    if (raw.empty()) {
+        return false;
+    }
+    char* end = nullptr;
+    index = std::strtoll(raw.c_str(), &end, 10);
+    return end != raw.c_str() && *end == '\0';
+}
+
+static bool split_obj_objects_to_off(
+    const string& obj_path,
+    const fs::path& output_dir,
+    const string& stem,
+    vector<string>& off_paths,
+    Logger& log) {
+    std::ifstream in(obj_path);
+    if (!in.is_open()) {
+        log.warn("OBJ_SPLIT", "Cannot open OBJ for split: ", obj_path);
+        return false;
+    }
+
+    vector<ObjVertex> vertices;
+    vector<vector<vector<long long>>> object_faces;
+    string current_name = "default";
+    bool saw_named_object = false;
+
+    auto ensure_object = [&]() -> vector<vector<long long>>& {
+        if (object_faces.empty()) {
+            object_faces.emplace_back();
+        }
+        return object_faces.back();
+    };
+
+    string line;
+    while (std::getline(in, line)) {
+        const string t = trim(line);
+        if (t.empty() || t[0] == '#') {
+            continue;
+        }
+        std::istringstream iss(t);
+        string tag;
+        iss >> tag;
+
+        if (tag == "v") {
+            ObjVertex v;
+            if (!(iss >> v.x >> v.y >> v.z)) {
+                log.warn("OBJ_SPLIT", "Invalid vertex line in ", obj_path, ": ", t);
+                return false;
+            }
+            vertices.push_back(v);
+        } else if (tag == "o" || tag == "g") {
+            string name;
+            iss >> name;
+            if (name.empty()) {
+                name = "object";
+            }
+            if (!saw_named_object || !ensure_object().empty()) {
+                object_faces.emplace_back();
+            }
+            current_name = name;
+            saw_named_object = true;
+        } else if (tag == "f") {
+            vector<long long> face;
+            string tok;
+            while (iss >> tok) {
+                long long idx = 0;
+                if (!parse_obj_face_vertex(tok, idx)) {
+                    log.warn("OBJ_SPLIT", "Invalid face token in ", obj_path, ": ", tok);
+                    return false;
+                }
+                if (idx < 0) {
+                    idx = static_cast<long long>(vertices.size()) + idx + 1;
+                }
+                if (idx <= 0 || idx > static_cast<long long>(vertices.size())) {
+                    log.warn("OBJ_SPLIT", "Face index out of range in ", obj_path, ": ", idx);
+                    return false;
+                }
+                face.push_back(idx - 1);
+            }
+            if (face.size() >= 3) {
+                ensure_object().push_back(face);
+            }
+        }
+    }
+
+    vector<vector<vector<long long>>> non_empty;
+    for (auto& faces : object_faces) {
+        if (!faces.empty()) {
+            non_empty.push_back(std::move(faces));
+        }
+    }
+    if (non_empty.size() <= 1) {
+        return false;
+    }
+
+    fs::create_directories(output_dir);
+    off_paths.clear();
+    off_paths.reserve(non_empty.size());
+
+    for (size_t obj_i = 0; obj_i < non_empty.size(); ++obj_i) {
+        const fs::path off_path = output_dir / (stem + ".objpart_" + std::to_string(obj_i) + ".off");
+        std::ofstream out(off_path, std::ios::out | std::ios::trunc);
+        if (!out.is_open()) {
+            log.warn("OBJ_SPLIT", "Cannot write split OFF: ", off_path.string());
+            return false;
+        }
+
+        std::unordered_map<long long, uint32_t> remap;
+        vector<long long> ordered_vertices;
+        for (const auto& face : non_empty[obj_i]) {
+            for (long long old_idx : face) {
+                if (!remap.count(old_idx)) {
+                    remap[old_idx] = static_cast<uint32_t>(ordered_vertices.size());
+                    ordered_vertices.push_back(old_idx);
+                }
+            }
+        }
+
+        out << "OFF\n";
+        out << ordered_vertices.size() << " " << non_empty[obj_i].size() << " 0\n";
+        for (long long old_idx : ordered_vertices) {
+            const ObjVertex& v = vertices[static_cast<size_t>(old_idx)];
+            out << std::fixed << std::setprecision(15) << v.x << " " << v.y << " " << v.z << "\n";
+        }
+        for (const auto& face : non_empty[obj_i]) {
+            out << face.size();
+            for (long long old_idx : face) {
+                out << " " << remap[old_idx];
+            }
+            out << "\n";
+        }
+        off_paths.push_back(off_path.string());
+    }
+
+    log.info("OBJ_SPLIT", "Split ", obj_path, " into ", off_paths.size(), " object OFF files");
+    return true;
+}
+
 static bool extract_facet_index_from_stderr(const string& stderr_path, size_t& facet_index_out) {
     std::ifstream in(stderr_path);
     if (!in.is_open()) {
@@ -748,6 +895,41 @@ static void process_entries(
                 progress_maybe_log(i + 1, entries.size());
                 continue;
             }
+        }
+
+        vector<string> split_offs;
+        const fs::path split_dir = fs::path(cfg.work_dir) / (r.obj_id + ".objparts");
+        if (split_obj_objects_to_off(obj_path, split_dir, r.obj_id, split_offs, log)) {
+            size_t kept_parts = 0;
+            for (size_t part_i = 0; part_i < split_offs.size(); ++part_i) {
+                const string repaired_part =
+                    (fs::path(cfg.work_dir) / (r.obj_id + ".objpart_" + std::to_string(part_i) + ".sanitized.off")).string();
+                OffRepairStats part_stats;
+                if (!sanitize_off_for_tdbase(split_offs[part_i], repaired_part, part_stats, log)) {
+                    log.warn("OBJ_SPLIT", "Split OFF repair failed id=", r.obj_id, " part=", part_i);
+                    continue;
+                }
+                if (part_stats.kept_faces == 0) {
+                    log.warn("OBJ_SPLIT", "Split OFF repair produced zero faces id=", r.obj_id, " part=", part_i);
+                    continue;
+                }
+                off_paths.push_back(repaired_part);
+                ++kept_parts;
+            }
+            if (kept_parts == 0) {
+                r.reason = "obj_split_repair_empty";
+                log.warn("OBJ_SPLIT", "All split parts were rejected id=", r.obj_id);
+                results.push_back(r);
+                progress_maybe_log(i + 1, entries.size());
+                continue;
+            }
+            r.off_path = split_dir.string();
+            r.success = true;
+            r.reason = "ok_split_objects";
+            results.push_back(r);
+            log.info("OBJ", "Accepted id=", r.obj_id, " split_parts=", kept_parts);
+            progress_maybe_log(i + 1, entries.size());
+            continue;
         }
 
         const string repaired_off = (fs::path(cfg.work_dir) / (r.obj_id + ".sanitized.off")).string();

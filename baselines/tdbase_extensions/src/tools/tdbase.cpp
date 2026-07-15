@@ -350,7 +350,7 @@ static void pack(int argc, char **argv){
 	}
 
 	Tile *tile = new Tile(wrappers);
-	tile->dump_compressed(output_path);
+	tile->dump_raw(output_path);
 	delete tile;
 }
 
