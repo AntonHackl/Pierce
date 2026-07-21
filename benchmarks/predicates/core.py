@@ -17,6 +17,9 @@ QUERY_CHOICES = ["overlap", "intersection", "containment"]
 
 GROUP_COLORS = {
     "Selectivity estimation": "#4C78A8",
+    "Measured hash/raytrace query": "#F58518",
+    "Hash compaction/result movement": "#B279A2",
+    "Global GPU deduplication": "#54A24B",
     "Edge raytrace Mesh1->Mesh2": "#F58518",
     "Edge raytrace Mesh2->Mesh1": "#E45756",
     "Containment raytrace Mesh1->Mesh2": "#72B7B2",
@@ -29,6 +32,18 @@ GROUPED_BREAKDOWN_COMPONENTS = [
     (
         "Selectivity estimation",
         ["selectivity estimation"],
+    ),
+    (
+        "Measured hash/raytrace query",
+        ["measured hash/raytrace query"],
+    ),
+    (
+        "Hash compaction/result movement",
+        ["hash compaction/result movement"],
+    ),
+    (
+        "Global GPU deduplication",
+        ["global gpu deduplication"],
     ),
     (
         "Edge raytrace Mesh1->Mesh2",
@@ -95,6 +110,7 @@ def build_pierce_query_adapters(
     include_overlap_pairs: bool,
     track_gpu_memory: bool = False,
     overlap_max_iterations: int = 100,
+    num_gpus: int = 1,
 ) -> Dict[str, Any]:
     pierce_dir = repo_root / "pierce"
 
@@ -107,6 +123,7 @@ def build_pierce_query_adapters(
         warmup_runs=warmup_runs,
         overlap_max_iterations=overlap_max_iterations,
         track_gpu_memory=track_gpu_memory,
+        num_gpus=num_gpus,
     )
     intersection = PierceIntersectionAdapter(
         str(pierce_dir),
@@ -115,6 +132,7 @@ def build_pierce_query_adapters(
         timings_dir=str(data_dirs["timings"]),
         grid_cell_size=grid_cell_size,
         warmup_runs=warmup_runs,
+        num_gpus=num_gpus,
     )
     containment = PierceContainmentAdapter(
         str(pierce_dir),
@@ -201,7 +219,7 @@ def build_intersection_extra_args(
     hash_load_factor: float,
     enable_profiling_stats: bool,
     track_overflow: bool,
-    track_gpu_memory: bool,
+    track_gpu_memory: bool = False,
     intersection_query_direction: str,
 ) -> list[str]:
     args = [

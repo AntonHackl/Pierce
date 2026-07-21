@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from benchmarks.common.adapters.base import ContainmentBenchmarkAdapter, run_command_streaming
+from benchmarks.common.pierce_preprocessed import is_current_binary_geometry
 
 
 class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
@@ -40,7 +41,11 @@ class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
         return self.preprocessed_dir / f"{input_path.stem}_g{grid_token}.pre"
 
     def check_preprocessed(self, file_path: str) -> bool:
-        return self._get_preprocessed_path(file_path).exists()
+        preprocessed_path = self._get_preprocessed_path(file_path)
+        return preprocessed_path.exists() and is_current_binary_geometry(
+            preprocessed_path,
+            self.pierce_dir.parent,
+        )
 
     def preprocess_from_source(self, source_file: str, dt_file: str, log_dir: Optional[str] = None):
         source_path = Path(source_file)

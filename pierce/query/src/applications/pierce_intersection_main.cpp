@@ -187,6 +187,45 @@ struct ContainmentFingerprintRow {
     unsigned long long fingerprintSum = 0;
 };
 
+struct IntersectionResidentWorkerState {
+    int deviceId = 0;
+    std::unique_ptr<GeometryUploader> mesh1Uploader;
+    std::unique_ptr<GeometryUploader> mesh2Uploader;
+    std::unique_ptr<OptixAccelerationStructure> mesh1AS;
+    std::unique_ptr<OptixAccelerationStructure> mesh2AS;
+    EdgeMeshData mesh1EdgeData;
+    EdgeMeshData mesh2EdgeData;
+    int* d_first_triangle_mesh1 = nullptr;
+    int* d_first_triangle_mesh2 = nullptr;
+    int* d_source_object_ids_mesh1 = nullptr;
+    int* d_source_object_ids_mesh2 = nullptr;
+    float3* d_launch_points_mesh1 = nullptr;
+    float3* d_launch_points_mesh2 = nullptr;
+    GpuMemoryTracker memoryTracker;
+
+    explicit IntersectionResidentWorkerState(int device, bool trackGpuMemory)
+        : deviceId(device), memoryTracker(trackGpuMemory) {}
+
+    ~IntersectionResidentWorkerState() {
+        CUDA_CHECK(cudaSetDevice(deviceId));
+        mesh2AS.reset();
+        mesh1AS.reset();
+        PrecomputedEdgeData::freeEdgeData(mesh1EdgeData);
+        PrecomputedEdgeData::freeEdgeData(mesh2EdgeData);
+        if (d_first_triangle_mesh1) CUDA_CHECK(cudaFree(d_first_triangle_mesh1));
+        if (d_first_triangle_mesh2) CUDA_CHECK(cudaFree(d_first_triangle_mesh2));
+        if (d_source_object_ids_mesh1) CUDA_CHECK(cudaFree(d_source_object_ids_mesh1));
+        if (d_source_object_ids_mesh2) CUDA_CHECK(cudaFree(d_source_object_ids_mesh2));
+        if (d_launch_points_mesh1) CUDA_CHECK(cudaFree(d_launch_points_mesh1));
+        if (d_launch_points_mesh2) CUDA_CHECK(cudaFree(d_launch_points_mesh2));
+        if (mesh1Uploader) mesh1Uploader->free();
+        if (mesh2Uploader) mesh2Uploader->free();
+    }
+
+    IntersectionResidentWorkerState(const IntersectionResidentWorkerState&) = delete;
+    IntersectionResidentWorkerState& operator=(const IntersectionResidentWorkerState&) = delete;
+};
+
 struct IntersectionGpuWorkerResult {
     MeshQueryResult* dPairs = nullptr;
     long long numPairs = 0;
@@ -200,6 +239,7 @@ struct IntersectionGpuWorkerResult {
     unsigned long long peakMemoryBytes = 0;
     IntersectionWorkerTimingStats timing;
     int slabIndex = 0;
+    std::unique_ptr<IntersectionResidentWorkerState> residentState;
 };
 
 void writeIntersectionPairsCsv(
@@ -473,43 +513,44 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     CUDA_CHECK(cudaSetDevice(deviceId));
     workerTiming.setDeviceUs += elapsedSince(phaseStart);
 
-    GpuMemoryTracker memoryTracker(config.trackGpuMemory);
+    auto resident = std::make_unique<IntersectionResidentWorkerState>(deviceId, config.trackGpuMemory);
+    GpuMemoryTracker& memoryTracker = resident->memoryTracker;
     OptixContext& context = *runtime.context;
     MeshIntersectionLauncher& intersectionLauncher = *runtime.launcher;
 
-    GeometryUploader mesh1Uploader;
+    resident->mesh1Uploader = std::make_unique<GeometryUploader>();
     phaseStart = std::chrono::high_resolution_clock::now();
-    mesh1Uploader.upload(slabPair.mesh1.geometry);
+    resident->mesh1Uploader->upload(slabPair.mesh1.geometry);
     memoryTracker.sample("intersection_after_upload_mesh1");
     workerTiming.uploadMesh1Us += elapsedSince(phaseStart);
 
-    GeometryUploader mesh2Uploader;
+    resident->mesh2Uploader = std::make_unique<GeometryUploader>();
     phaseStart = std::chrono::high_resolution_clock::now();
-    mesh2Uploader.upload(slabPair.mesh2.geometry);
+    resident->mesh2Uploader->upload(slabPair.mesh2.geometry);
     memoryTracker.sample("intersection_after_upload_mesh2");
     workerTiming.uploadMesh2Us += elapsedSince(phaseStart);
 
-    OptixAccelerationStructure mesh1AS(context, mesh1Uploader);
+    resident->mesh1AS = std::make_unique<OptixAccelerationStructure>(context, *resident->mesh1Uploader);
     phaseStart = std::chrono::high_resolution_clock::now();
-    mesh1AS.build(&memoryTracker, "build_mesh1_gas");
+    resident->mesh1AS->build(&memoryTracker, "build_mesh1_gas");
     workerTiming.buildMesh1AsUs += elapsedSince(phaseStart);
 
-    OptixAccelerationStructure mesh2AS(context, mesh2Uploader);
+    resident->mesh2AS = std::make_unique<OptixAccelerationStructure>(context, *resident->mesh2Uploader);
     phaseStart = std::chrono::high_resolution_clock::now();
-    mesh2AS.build(&memoryTracker, "build_mesh2_gas");
+    resident->mesh2AS->build(&memoryTracker, "build_mesh2_gas");
     workerTiming.buildMesh2AsUs += elapsedSince(phaseStart);
 
     phaseStart = std::chrono::high_resolution_clock::now();
-    EdgeMeshData mesh1EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh1.geometry);
+    resident->mesh1EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh1.geometry);
     workerTiming.uploadMesh1EdgesUs += elapsedSince(phaseStart);
     phaseStart = std::chrono::high_resolution_clock::now();
-    EdgeMeshData mesh2EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh2.geometry);
+    resident->mesh2EdgeData = PrecomputedEdgeData::uploadFromGeometry(slabPair.mesh2.geometry);
     workerTiming.uploadMesh2EdgesUs += elapsedSince(phaseStart);
 
-    const int mesh1NumTriangles = static_cast<int>(mesh1Uploader.getNumIndices());
-    const int mesh2NumTriangles = static_cast<int>(mesh2Uploader.getNumIndices());
-    const int mesh1NumEdges = mesh1EdgeData.num_edges;
-    const int mesh2NumEdges = mesh2EdgeData.num_edges;
+    const int mesh1NumTriangles = static_cast<int>(resident->mesh1Uploader->getNumIndices());
+    const int mesh2NumTriangles = static_cast<int>(resident->mesh2Uploader->getNumIndices());
+    const int mesh1NumEdges = resident->mesh1EdgeData.num_edges;
+    const int mesh2NumEdges = resident->mesh2EdgeData.num_edges;
     const int mesh1NumObjects = static_cast<int>(slabPair.mesh1.localObjectToGlobalObject.size());
     const int mesh2NumObjects = static_cast<int>(slabPair.mesh2.localObjectToGlobalObject.size());
 
@@ -528,32 +569,25 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     }
     workerTiming.allocHashAndProfilingUs += elapsedSince(phaseStart);
 
-    int* d_first_triangle_mesh1 = nullptr;
-    int* d_first_triangle_mesh2 = nullptr;
-    int* d_source_object_ids_mesh1 = nullptr;
-    int* d_source_object_ids_mesh2 = nullptr;
-    float3* d_launch_points_mesh1 = nullptr;
-    float3* d_launch_points_mesh2 = nullptr;
-
     phaseStart = std::chrono::high_resolution_clock::now();
     if (mesh1NumObjects > 0) {
-        CUDA_CHECK(cudaMalloc(&d_first_triangle_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&resident->d_first_triangle_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(
-            d_first_triangle_mesh1,
+            resident->d_first_triangle_mesh1,
             slabPair.mesh1.firstTriangleIndexPerLocalObject.data(),
             static_cast<size_t>(mesh1NumObjects) * sizeof(int),
             cudaMemcpyHostToDevice
         ));
-        CUDA_CHECK(cudaMalloc(&d_source_object_ids_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&resident->d_source_object_ids_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(
-            d_source_object_ids_mesh1,
+            resident->d_source_object_ids_mesh1,
             slabPair.mesh1.localObjectToGlobalObject.data(),
             static_cast<size_t>(mesh1NumObjects) * sizeof(int),
             cudaMemcpyHostToDevice
         ));
-        CUDA_CHECK(cudaMalloc(&d_launch_points_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(float3)));
+        CUDA_CHECK(cudaMalloc(&resident->d_launch_points_mesh1, static_cast<size_t>(mesh1NumObjects) * sizeof(float3)));
         CUDA_CHECK(cudaMemcpy(
-            d_launch_points_mesh1,
+            resident->d_launch_points_mesh1,
             slabPair.mesh1.launchPointPerLocalObject.data(),
             static_cast<size_t>(mesh1NumObjects) * sizeof(float3),
             cudaMemcpyHostToDevice
@@ -561,23 +595,23 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     }
 
     if (mesh2NumObjects > 0) {
-        CUDA_CHECK(cudaMalloc(&d_first_triangle_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&resident->d_first_triangle_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(
-            d_first_triangle_mesh2,
+            resident->d_first_triangle_mesh2,
             slabPair.mesh2.firstTriangleIndexPerLocalObject.data(),
             static_cast<size_t>(mesh2NumObjects) * sizeof(int),
             cudaMemcpyHostToDevice
         ));
-        CUDA_CHECK(cudaMalloc(&d_source_object_ids_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&resident->d_source_object_ids_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(int)));
         CUDA_CHECK(cudaMemcpy(
-            d_source_object_ids_mesh2,
+            resident->d_source_object_ids_mesh2,
             slabPair.mesh2.localObjectToGlobalObject.data(),
             static_cast<size_t>(mesh2NumObjects) * sizeof(int),
             cudaMemcpyHostToDevice
         ));
-        CUDA_CHECK(cudaMalloc(&d_launch_points_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(float3)));
+        CUDA_CHECK(cudaMalloc(&resident->d_launch_points_mesh2, static_cast<size_t>(mesh2NumObjects) * sizeof(float3)));
         CUDA_CHECK(cudaMemcpy(
-            d_launch_points_mesh2,
+            resident->d_launch_points_mesh2,
             slabPair.mesh2.launchPointPerLocalObject.data(),
             static_cast<size_t>(mesh2NumObjects) * sizeof(float3),
             cudaMemcpyHostToDevice
@@ -706,27 +740,27 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     workerTiming.allocOptionalDiagnosticsUs += elapsedSince(phaseStart);
 
     MeshIntersectionLaunchParams params1{};
-    params1.mesh1_vertices = mesh1Uploader.getVertices();
-    params1.mesh1_indices = mesh1Uploader.getIndices();
-    params1.mesh1_triangle_to_object = mesh1Uploader.getTriangleToObject();
+    params1.mesh1_vertices = resident->mesh1Uploader->getVertices();
+    params1.mesh1_indices = resident->mesh1Uploader->getIndices();
+    params1.mesh1_triangle_to_object = resident->mesh1Uploader->getTriangleToObject();
     params1.mesh1_num_triangles = mesh1NumTriangles;
     params1.mesh1_num_objects = mesh1NumObjects;
-    params1.edge_starts = mesh1EdgeData.d_edge_starts;
-    params1.edge_ends = mesh1EdgeData.d_edge_ends;
-    params1.edge_source_object_ids = mesh1EdgeData.d_source_object_ids;
+    params1.edge_starts = resident->mesh1EdgeData.d_edge_starts;
+    params1.edge_ends = resident->mesh1EdgeData.d_edge_ends;
+    params1.edge_source_object_ids = resident->mesh1EdgeData.d_source_object_ids;
     params1.num_edges = mesh1NumEdges;
-    params1.mesh2_handle = mesh2AS.getHandle();
-    params1.mesh2_vertices = mesh2Uploader.getVertices();
-    params1.mesh2_indices = mesh2Uploader.getIndices();
-    params1.mesh2_triangle_to_object = mesh2Uploader.getTriangleToObject();
+    params1.mesh2_handle = resident->mesh2AS->getHandle();
+    params1.mesh2_vertices = resident->mesh2Uploader->getVertices();
+    params1.mesh2_indices = resident->mesh2Uploader->getIndices();
+    params1.mesh2_triangle_to_object = resident->mesh2Uploader->getTriangleToObject();
     params1.mesh2_num_objects = static_cast<int>(slabPair.mesh2.localObjectToGlobalObject.size());
     params1.hash_table = d_hash_table;
     params1.hash_table_size = slabPair.hashTableSize;
     params1.use_hash_table = true;
     params1.hash_insert_failure_counter = d_hash_insert_failures;
-    params1.first_triangle_index_per_object = d_first_triangle_mesh1;
-    params1.source_object_ids_by_launch_index = d_source_object_ids_mesh1;
-    params1.launch_points_per_object = d_launch_points_mesh1;
+    params1.first_triangle_index_per_object = resident->d_first_triangle_mesh1;
+    params1.source_object_ids_by_launch_index = resident->d_source_object_ids_mesh1;
+    params1.launch_points_per_object = resident->d_launch_points_mesh1;
     params1.overlap_max_iterations = config.overlapMaxIterations;
     params1.profiling_enabled = config.enableProfilingStats ? 1 : 0;
     params1.profiling_stats = d_profiling_stats;
@@ -748,27 +782,27 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     params1.containment_hit_histogram = d_hit_histogram_mesh1;
 
     MeshIntersectionLaunchParams params2{};
-    params2.mesh1_vertices = mesh2Uploader.getVertices();
-    params2.mesh1_indices = mesh2Uploader.getIndices();
-    params2.mesh1_triangle_to_object = mesh2Uploader.getTriangleToObject();
+    params2.mesh1_vertices = resident->mesh2Uploader->getVertices();
+    params2.mesh1_indices = resident->mesh2Uploader->getIndices();
+    params2.mesh1_triangle_to_object = resident->mesh2Uploader->getTriangleToObject();
     params2.mesh1_num_triangles = mesh2NumTriangles;
     params2.mesh1_num_objects = mesh2NumObjects;
-    params2.edge_starts = mesh2EdgeData.d_edge_starts;
-    params2.edge_ends = mesh2EdgeData.d_edge_ends;
-    params2.edge_source_object_ids = mesh2EdgeData.d_source_object_ids;
+    params2.edge_starts = resident->mesh2EdgeData.d_edge_starts;
+    params2.edge_ends = resident->mesh2EdgeData.d_edge_ends;
+    params2.edge_source_object_ids = resident->mesh2EdgeData.d_source_object_ids;
     params2.num_edges = mesh2NumEdges;
-    params2.mesh2_handle = mesh1AS.getHandle();
-    params2.mesh2_vertices = mesh1Uploader.getVertices();
-    params2.mesh2_indices = mesh1Uploader.getIndices();
-    params2.mesh2_triangle_to_object = mesh1Uploader.getTriangleToObject();
+    params2.mesh2_handle = resident->mesh1AS->getHandle();
+    params2.mesh2_vertices = resident->mesh1Uploader->getVertices();
+    params2.mesh2_indices = resident->mesh1Uploader->getIndices();
+    params2.mesh2_triangle_to_object = resident->mesh1Uploader->getTriangleToObject();
     params2.mesh2_num_objects = static_cast<int>(slabPair.mesh1.localObjectToGlobalObject.size());
     params2.hash_table = d_hash_table;
     params2.hash_table_size = slabPair.hashTableSize;
     params2.use_hash_table = true;
     params2.hash_insert_failure_counter = d_hash_insert_failures;
-    params2.first_triangle_index_per_object = d_first_triangle_mesh2;
-    params2.source_object_ids_by_launch_index = d_source_object_ids_mesh2;
-    params2.launch_points_per_object = d_launch_points_mesh2;
+    params2.first_triangle_index_per_object = resident->d_first_triangle_mesh2;
+    params2.source_object_ids_by_launch_index = resident->d_source_object_ids_mesh2;
+    params2.launch_points_per_object = resident->d_launch_points_mesh2;
     params2.overlap_max_iterations = config.overlapMaxIterations;
     params2.profiling_enabled = config.enableProfilingStats ? 1 : 0;
     params2.profiling_stats = d_profiling_stats;
@@ -1003,12 +1037,6 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     if (results.d_merged_results) CUDA_CHECK(cudaFree(results.d_merged_results));
     if (d_hash_insert_failures) CUDA_CHECK(cudaFree(d_hash_insert_failures));
     if (d_hash_table) CUDA_CHECK(cudaFree(d_hash_table));
-    if (d_first_triangle_mesh1) CUDA_CHECK(cudaFree(d_first_triangle_mesh1));
-    if (d_first_triangle_mesh2) CUDA_CHECK(cudaFree(d_first_triangle_mesh2));
-    if (d_source_object_ids_mesh1) CUDA_CHECK(cudaFree(d_source_object_ids_mesh1));
-    if (d_source_object_ids_mesh2) CUDA_CHECK(cudaFree(d_source_object_ids_mesh2));
-    if (d_launch_points_mesh1) CUDA_CHECK(cudaFree(d_launch_points_mesh1));
-    if (d_launch_points_mesh2) CUDA_CHECK(cudaFree(d_launch_points_mesh2));
     if (d_anyhit_candidate_object_ids_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_object_ids_mesh1));
     if (d_anyhit_candidate_parity_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_parity_mesh1));
     if (d_anyhit_candidate_hit_counts_mesh1) CUDA_CHECK(cudaFree(d_anyhit_candidate_hit_counts_mesh1));
@@ -1034,13 +1062,10 @@ static IntersectionGpuWorkerResult runIntersectionOnCurrentDevice(
     if (d_hit_histogram_mesh1) CUDA_CHECK(cudaFree(d_hit_histogram_mesh1));
     if (d_hit_histogram_mesh2) CUDA_CHECK(cudaFree(d_hit_histogram_mesh2));
 
-    PrecomputedEdgeData::freeEdgeData(mesh1EdgeData);
-    PrecomputedEdgeData::freeEdgeData(mesh2EdgeData);
-    mesh1Uploader.free();
-    mesh2Uploader.free();
     workerTiming.cleanupUs += elapsedSince(phaseStart);
     workerTiming.totalUs = elapsedSince(workerStart);
     workerResult.timing = workerTiming;
+    workerResult.residentState = std::move(resident);
 
     return workerResult;
 }
@@ -1894,28 +1919,43 @@ int main(int argc, char* argv[]) {
 
     recordIntersectionWorkerTimingStats(workerResults, timer);
 
-    std::vector<DevicePairBuffer> workerBuffers;
-    workerBuffers.reserve(workerResults.size());
-    for (const auto& workerResult : workerResults) {
-        workerBuffers.push_back({workerResult.deviceId, workerResult.dPairs, workerResult.numPairs});
-    }
-
-    const auto globalDedupStart = std::chrono::high_resolution_clock::now();
     GpuGlobalDedupResult globalDedupResult;
-    try {
-        globalDedupResult = gather_and_deduplicate_pairs_gpu(workerBuffers, 0);
-    } catch (const std::exception& ex) {
-        std::cerr << "Global GPU deduplication failed: " << ex.what() << std::endl;
-        return 1;
+    bool usedGlobalDedup = false;
+    long long globalDedupTotalUs = 0;
+    if (activeGpuCount == 1 && workerResults.size() == 1) {
+        globalDedupResult.aggregatorDeviceId = workerResults[0].deviceId;
+        globalDedupResult.inputCount = workerResults[0].numPairs;
+        globalDedupResult.uniqueCount = workerResults[0].numPairs;
+        globalDedupResult.d_uniquePairs = workerResults[0].dPairs;
+        workerResults[0].dPairs = nullptr;
+    } else {
+        std::vector<DevicePairBuffer> workerBuffers;
+        workerBuffers.reserve(workerResults.size());
+        for (const auto& workerResult : workerResults) {
+            workerBuffers.push_back({workerResult.deviceId, workerResult.dPairs, workerResult.numPairs});
+        }
+
+        const auto globalDedupStart = std::chrono::high_resolution_clock::now();
+        try {
+            GpuMemoryTracker* dedupMemoryTracker =
+                (!workerResults.empty() && workerResults[0].residentState)
+                    ? &workerResults[0].residentState->memoryTracker
+                    : nullptr;
+            globalDedupResult = gather_and_deduplicate_pairs_gpu(workerBuffers, 0, dedupMemoryTracker);
+            usedGlobalDedup = true;
+        } catch (const std::exception& ex) {
+            std::cerr << "Global GPU deduplication failed: " << ex.what() << std::endl;
+            return 1;
+        }
+        globalDedupTotalUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - globalDedupStart
+        ).count();
     }
-    const long long globalDedupTotalUs = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::high_resolution_clock::now() - globalDedupStart
-    ).count();
 
     std::cout << "Actual Intersection Pairs: " << globalDedupResult.uniqueCount << std::endl;
     timer.addCounter("Profile_Actual_Intersection_Pairs", static_cast<unsigned long long>(globalDedupResult.uniqueCount));
     timer.addCounter("Profile_Active_GPU_Count", static_cast<unsigned long long>(activeGpuCount));
-    timer.addCounter("Profile_Global_Dedup_Mode", 1ULL);
+    timer.addCounter("Profile_Global_Dedup_Mode", usedGlobalDedup ? 1ULL : 0ULL);
     timer.addCounter("Profile_Global_Dedup_Aggregator_Device", static_cast<unsigned long long>(globalDedupResult.aggregatorDeviceId));
     timer.addCounter("Profile_Global_Dedup_Input_Pairs", static_cast<unsigned long long>(globalDedupResult.inputCount));
     timer.addCounter("Profile_Global_Dedup_Unique_Pairs", static_cast<unsigned long long>(globalDedupResult.uniqueCount));
@@ -1924,7 +1964,9 @@ int main(int argc, char* argv[]) {
     timer.addCounter("Profile_Global_Dedup_Total_Us", static_cast<unsigned long long>(globalDedupTotalUs));
     timer.addCounter(
         "Profile_Global_Dedup_Buffer_Bytes",
-        static_cast<unsigned long long>(globalDedupResult.inputCount) * static_cast<unsigned long long>(sizeof(MeshQueryResult))
+        usedGlobalDedup
+            ? static_cast<unsigned long long>(globalDedupResult.inputCount) * static_cast<unsigned long long>(sizeof(MeshQueryResult))
+            : 0ULL
     );
 
     unsigned long long aggregateHashInsertFailures = 0;
@@ -2016,7 +2058,13 @@ int main(int argc, char* argv[]) {
 
     if (trackGpuMemory) {
         unsigned long long peakMemoryBytes = 0;
-        for (const auto& workerResult : workerResults) {
+        for (auto& workerResult : workerResults) {
+            if (workerResult.residentState) {
+                workerResult.peakMemoryBytes = std::max(
+                    workerResult.peakMemoryBytes,
+                    static_cast<unsigned long long>(workerResult.residentState->memoryTracker.getPeakUsedBytes())
+                );
+            }
             peakMemoryBytes = std::max(peakMemoryBytes, workerResult.peakMemoryBytes);
         }
         timer.addCounter("Profile_GPU_Peak_Used_Bytes", peakMemoryBytes);
@@ -2025,6 +2073,8 @@ int main(int argc, char* argv[]) {
     }
 
     timer.next("Cleanup");
+    workerResults.clear();
+    workerRuntimes.clear();
     timer.finish(outputJsonPath);
     return 0;
 }

@@ -6,6 +6,13 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from .base import OverlapBenchmarkAdapter, run_command_streaming
+from benchmarks.common.pierce_preprocessed import is_current_binary_geometry
+from benchmarks.common.pierce_timing import (
+    TIMING_POLICY,
+    aggregate_breakdowns,
+    phase_values_from_json,
+    summarize_pierce_timing,
+)
 
 class PierceAdapter(OverlapBenchmarkAdapter):
     def __init__(
@@ -22,6 +29,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         hash_table_free_mem_fraction: Optional[float] = None,
         overlap_max_iterations: int = 100,
         track_gpu_memory: bool = False,
+        num_gpus: int = 1,
     ):
         """
         mode: 'exact' or 'direct_estimation'
@@ -42,6 +50,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         self.hash_table_free_mem_fraction = hash_table_free_mem_fraction
         self.overlap_max_iterations = overlap_max_iterations
         self.track_gpu_memory = track_gpu_memory
+        self.num_gpus = num_gpus
         # Ensure directories exist
         self.timings_dir.mkdir(parents=True, exist_ok=True)
         self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +77,11 @@ class PierceAdapter(OverlapBenchmarkAdapter):
 
     def check_preprocessed(self, file_path: str) -> bool:
         """Check if .pre file exists for the given .dt or .obj file in preprocessed dir."""
-        return self._get_preprocessed_path(file_path).exists()
+        preprocessed_path = self._get_preprocessed_path(file_path)
+        return preprocessed_path.exists() and is_current_binary_geometry(
+            preprocessed_path,
+            self.pierce_dir.parent,
+        )
 
     def preprocess(self, file_path: str):
         """Run the Pierce preprocessing tool including grid generation."""
@@ -132,6 +145,8 @@ class PierceAdapter(OverlapBenchmarkAdapter):
 
         runtimes = []
         breakdown_accum = {} # key: phase name, value: list of durations
+        overhead_breakdowns = []
+        active_gpu_counts = []
         num_obj1 = 0
         num_obj2 = 0
         num_intersections = 0
@@ -158,23 +173,6 @@ class PierceAdapter(OverlapBenchmarkAdapter):
             adapter_log_dir = Path(log_dir) / self.name
             adapter_log_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.mode == "exact":
-            expected_prefixes = [
-                "raytrace_",
-                "gpu deduplication",
-                "download results",
-                "query",
-            ]
-        elif self.mode in ("direct_estimation", "estimated"):
-            # For direct_estimation/estimated mode, include selectivity estimation in query time
-            expected_prefixes = [
-                "selectivity estimation",
-                "raytrace_hash_",
-                "download results",
-                "query",
-                "compact_hash_table_pairs",
-            ]
-
         # Execute num_runs times, each with warmup
         for run_idx in range(num_runs):
             json_output = self.timings_dir / f"timing_{self.mode}_{int(time.time())}_{run_idx}.json"
@@ -191,6 +189,7 @@ class PierceAdapter(OverlapBenchmarkAdapter):
 
             if self.mode == "direct_estimation":
                 cmd.extend(["--query-direction", query_direction])
+                cmd.extend(["--num-gpus", str(self.num_gpus)])
                 if not self.use_alpha_correction:
                     cmd.append("--no-alpha-correction")
                 if self.track_hash_contention:
@@ -334,71 +333,28 @@ class PierceAdapter(OverlapBenchmarkAdapter):
                 with open(json_output, 'r') as f:
                     data = json.load(f)
 
-                phases = data.get("phases", {})
                 counters = data.get("counters", {})
-                phase_values = {}
-                for key, phase_data in phases.items():
-                    normalized_key = re.sub(r"_\d+$", "", key.lower())
-                    phase_values[normalized_key] = phase_values.get(normalized_key, 0.0) + phase_data.get("duration_ms", 0.0)
+                phase_values = phase_values_from_json(data)
                 gpu_memory_peak_used_bytes = int(counters.get("gpu_memory_peak_used_bytes", gpu_memory_peak_used_bytes))
                 gpu_memory_peak_free_bytes = int(counters.get("gpu_memory_peak_free_bytes", gpu_memory_peak_free_bytes))
                 gpu_memory_total_bytes = int(counters.get("gpu_memory_total_bytes", gpu_memory_total_bytes))
 
-                has_detailed_raytrace = any(k.startswith("raytrace_") for k in phase_values.keys())
+                try:
+                    timing = summarize_pierce_timing(
+                        data,
+                        include_global_dedup=True,
+                        require_worker_counters=(self.mode == "direct_estimation"),
+                    )
+                except ValueError as exc:
+                    return {"error": f"{exc} in {json_output}"}
 
-                if self.mode == "exact":
-                    # Sum all relevant phases to get the total query time.
-                    query_time = sum(v for k, v in phase_values.items() if k.startswith("raytrace_"))
-                    query_time += phase_values.get("gpu deduplication", 0.0)
-                    query_time += phase_values.get("download results", 0.0)
-                elif self.mode in ("estimated", "direct_estimation"):
-                    # Sum all relevant phases to get the total query time.
-                    components = [
-                        "selectivity estimation",
-                        "raytrace_hash_mesh1tomesh2",
-                        "raytrace_hash_mesh2tomesh1",
-                        "raytrace_overlap_hash_mesh1tomesh2",
-                        "raytrace_overlap_hash_mesh2tomesh1",
-                        "compact_hash_table_pairs",
-                        "download results",
-                    ]
-                    query_time = sum(phase_values.get(c, 0.0) for c in components)
-                    if query_time <= 0.0:
-                         # Fallback to 'query' or 'execute hash query' if components not found
-                         query_time = phase_values.get("execute hash query", 0.0) or phase_values.get("query", 0.0)
-                elif self.mode == "estimated":
-                    # Sum all relevant phases for intersection_estimated
-                    components = [
-                        "selectivity estimation",
-                        "raytrace_hash_mesh1tomesh2",
-                        "raytrace_hash_mesh2tomesh1",
-                        "raytrace_overlap_hash_mesh1tomesh2",
-                        "raytrace_overlap_hash_mesh2tomesh1",
-                        "raytrace_containment_hash_mesh1tomesh2",
-                        "raytrace_containment_hash_mesh2tomesh1",
-                        "compact_hash_table_pairs",
-                        "download results",
-                    ]
-                    query_time = sum(phase_values.get(c, 0.0) for c in components)
-                    if query_time <= 0.0:
-                         query_time = phase_values.get("execute hash query", 0.0) or phase_values.get("query", 0.0)
-                else:
-                    # In direct_estimation mode, if no components found, fallback
-                    query_time = phase_values.get("execute hash query", 0.0) or phase_values.get("query", 0.0)
+                for phase, duration in timing.breakdown.items():
+                    breakdown_accum.setdefault(phase, []).append(duration)
+                overhead_breakdowns.append(timing.overhead_breakdown)
+                if timing.num_gpus_active is not None:
+                    active_gpu_counts.append(timing.num_gpus_active)
 
-                found = query_time > 0.0
-
-                for normalized_key, duration in phase_values.items():
-                    if has_detailed_raytrace and normalized_key in ("query", "execute hash query"):
-                        continue
-                    if normalized_key not in breakdown_accum:
-                        breakdown_accum[normalized_key] = []
-                    breakdown_accum[normalized_key].append(duration)
-
-                if not found:
-                    return {"error": f"Expected timing phases not found in {json_output}"}
-
-                runtimes.append(query_time)
+                runtimes.append(timing.query_time_ms)
 
             except subprocess.TimeoutExpired:
                 print(f"[{self.name}] Timeout reached ({timeout}s)")
@@ -414,10 +370,10 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         if not runtimes:
             return {"error": "No timing results collected for Pierce"}
 
-        # Calculate mean breakdown
         breakdown_stats = {}
         for phase, times in breakdown_accum.items():
             breakdown_stats[phase] = np.mean(times)
+        overhead_breakdown = aggregate_breakdowns(overhead_breakdowns)
 
         return {
             "mean": np.mean(runtimes),
@@ -426,6 +382,10 @@ class PierceAdapter(OverlapBenchmarkAdapter):
             "std": np.std(runtimes),
             "raw_times": runtimes,
             "breakdown": breakdown_stats,
+            "overhead_breakdown": overhead_breakdown,
+            "timing_policy": TIMING_POLICY,
+            "num_gpus_requested": self.num_gpus,
+            "num_gpus_active": max(active_gpu_counts) if active_gpu_counts else None,
             "num_obj1": num_obj1,
             "num_obj2": num_obj2,
             "num_intersections": num_intersections,

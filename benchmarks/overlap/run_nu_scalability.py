@@ -127,6 +127,7 @@ def run_experiment(
     timeout=120.0,
     dataset_profile="standard",
     tdbase_timing_mode=TDBASE_TIMING_MODE_INDEX_COMPUTE_EVALUATE,
+    num_gpus=1,
 ):
     if approaches is None:
         approaches = ["exact", "direct_estimation", "cgal", "touch", "tdbase"]
@@ -185,6 +186,7 @@ def run_experiment(
         grid_cell_size=grid_cell_size,
         warmup_runs=1,
         track_hash_contention=track_hash_contention,
+        num_gpus=num_gpus,
     )
 
     cgal_adapter = CGALAdapter(
@@ -213,7 +215,7 @@ def run_experiment(
         "counts": [],
         "enabled_approaches": approaches,
         "exact": {"mean": [], "std": [], "breakdown": []},
-        "direct_estimation": {"mean": [], "std": [], "breakdown": []},
+        "direct_estimation": {"mean": [], "std": [], "breakdown": [], "overhead_breakdown": [], "num_gpus_active": []},
         "cgal": {"mean": [], "std": []},
         "touch": {"mean": [], "std": []},
         "tdbase": {"mean": [], "std": []},
@@ -239,14 +241,15 @@ def run_experiment(
             isolated_raw_dir,
         )
         
+        case_log_dir = run_log_dir / f"nu_{nu}"
         print(f"\nProcessing nu={nu}: {f_v_path.name} vs {f_n_path.name}")
 
         # Check/Run Preprocessing for Pierce (also used by Face/TOUCH adapters)
         needs_preprocessing = any(a in approaches for a in ["exact", "direct_estimation", "cgal", "touch"])
         if needs_preprocessing:
             print("Checking preprocessing...")
-            exact_adapter.preprocess_from_source(str(staged_v_path), str(staged_v_path), log_dir=str(run_log_dir))
-            exact_adapter.preprocess_from_source(str(staged_n_path), str(staged_n_path), log_dir=str(run_log_dir))
+            exact_adapter.preprocess_from_source(str(staged_v_path), str(staged_v_path), log_dir=str(case_log_dir))
+            exact_adapter.preprocess_from_source(str(staged_n_path), str(staged_n_path), log_dir=str(case_log_dir))
 
         # Run Exact Benchmark
         res_exact = {"mean": None, "std": None, "breakdown": {}}
@@ -256,7 +259,7 @@ def run_experiment(
                 str(staged_v_path), 
                 str(staged_n_path), 
                 runs,
-                log_dir=str(run_log_dir),
+                log_dir=str(case_log_dir),
                 timeout=timeout
             )
             if "error" in res_exact:
@@ -271,7 +274,7 @@ def run_experiment(
                 str(staged_v_path), 
                 str(staged_n_path), 
                 runs,
-                log_dir=str(run_log_dir),
+                log_dir=str(case_log_dir),
                 timeout=timeout
             )
             if "error" in res_direct:
@@ -286,7 +289,7 @@ def run_experiment(
                 str(staged_v_path), 
                 str(staged_n_path), 
                 runs,
-                log_dir=str(run_log_dir),
+                log_dir=str(case_log_dir),
                 timeout=timeout
             )
             if "error" in res_cgal:
@@ -301,7 +304,7 @@ def run_experiment(
                 str(staged_v_path), 
                 str(staged_n_path), 
                 runs,
-                log_dir=str(run_log_dir),
+                log_dir=str(case_log_dir),
                 timeout=timeout
             )
             if "error" in res_touch:
@@ -312,14 +315,14 @@ def run_experiment(
         res_td = {"mean": None, "std": None}
         if "tdbase" in approaches:
             # Keep TDBase inputs symmetric and fresh for this pair.
-            tdbase_adapter.preprocess_from_source(str(staged_v_path), str(staged_v_path), log_dir=str(run_log_dir))
-            tdbase_adapter.preprocess_from_source(str(staged_n_path), str(staged_n_path), log_dir=str(run_log_dir))
+            tdbase_adapter.preprocess_from_source(str(staged_v_path), str(staged_v_path), log_dir=str(case_log_dir))
+            tdbase_adapter.preprocess_from_source(str(staged_n_path), str(staged_n_path), log_dir=str(case_log_dir))
             print(f"Running TDBase Mode ({runs} runs)...")
             res_td = tdbase_adapter.run_overlap(
                 str(staged_v_path), 
                 str(staged_n_path), 
                 runs,
-                log_dir=str(run_log_dir),
+                log_dir=str(case_log_dir),
                 timeout=timeout
             )
             if "error" in res_td:
@@ -335,6 +338,8 @@ def run_experiment(
         results["direct_estimation"]["mean"].append(res_direct["mean"])
         results["direct_estimation"]["std"].append(res_direct["std"])
         results["direct_estimation"]["breakdown"].append(res_direct.get("breakdown", {}))
+        results["direct_estimation"]["overhead_breakdown"].append(res_direct.get("overhead_breakdown", {}))
+        results["direct_estimation"]["num_gpus_active"].append(res_direct.get("num_gpus_active"))
         
         results["cgal"]["mean"].append(res_cgal["mean"])
         results["cgal"]["std"].append(res_cgal["std"])
@@ -593,6 +598,9 @@ def plot_results(results, figures_dir):
 
         phase_labels = {
             "selectivity estimation": "Selectivity Est.",
+            "measured hash/raytrace query": "Hash/Ray Query",
+            "hash compaction/result movement": "Compaction/Move",
+            "global gpu deduplication": "Global Dedup",
             "query": "Ray Query",
             "execute hash query": "Hash Query",
             "gpu deduplication": "Deduplication",
@@ -606,6 +614,9 @@ def plot_results(results, figures_dir):
         }
         phase_order = [
             "selectivity estimation",
+            "measured hash/raytrace query",
+            "hash compaction/result movement",
+            "global gpu deduplication",
             "raytrace_mesh1tomesh2_pass1",
             "raytrace_mesh2tomesh1_pass1",
             "raytrace_mesh1tomesh2_pass2",
@@ -619,6 +630,9 @@ def plot_results(results, figures_dir):
         ]
         phase_colors = {
             "selectivity estimation": "#ff9896",
+            "measured hash/raytrace query": "#7f7f7f",
+            "hash compaction/result movement": "#ffbb78",
+            "global gpu deduplication": "#98df8a",
             "raytrace_mesh1tomesh2_pass1": "#1f77b4",
             "raytrace_mesh2tomesh1_pass1": "#17becf",
             "raytrace_mesh2tomesh1_pass2": "#2ca02c",
@@ -773,6 +787,7 @@ def main():
     parser.add_argument("--tdbase-threads", type=int, default=None, help="Number of TDBase join threads")
     parser.add_argument("--tdbase-compute-threads", type=int, default=1, help="Number of TDBase compute threads per tile")
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout in seconds per run")
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs/slabs for Pierce direct_estimation")
     parser.add_argument("--revisualize", type=str, help="Path to results.json to re-generate plots from")
     parser.add_argument(
         "--tdbase-timing-mode",
@@ -827,6 +842,7 @@ def main():
             timeout=args.timeout,
             dataset_profile=args.dataset_profile,
             tdbase_timing_mode=args.tdbase_timing_mode,
+            num_gpus=args.num_gpus,
         )
         
         if results and results["counts"]:
@@ -878,6 +894,16 @@ def main():
                         "dataset_profile": args.dataset_profile,
                         "track_hash_contention": args.track_hash_contention,
                         "tdbase_timing_mode": args.tdbase_timing_mode,
+                        "num_gpus_requested": args.num_gpus,
+                        "num_gpus_active": max(
+                            [
+                                int(v)
+                                for v in clean_results.get("direct_estimation", {}).get("num_gpus_active", [])
+                                if isinstance(v, (int, float))
+                            ],
+                            default=None,
+                        ),
+                        "timing_policy": "steady_query_v1",
                         "isolated_data_root": str(isolated_data_dirs["root"]),
                     },
                     "results": clean_results,

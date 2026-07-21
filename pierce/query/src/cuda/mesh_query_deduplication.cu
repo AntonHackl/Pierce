@@ -6,6 +6,7 @@
 #include <chrono>
 #include <stdexcept>
 #include "../optix/OptixHelpers.h"
+#include "../utilities/GpuMemoryTracker.h"
 
 __device__ __host__ inline unsigned long long pair_to_key(int id1, int id2) {
     return (static_cast<unsigned long long>(id1) << 32) | static_cast<unsigned long long>(id2);
@@ -198,7 +199,8 @@ unsigned long long count_hash_table_pairs(
 
 GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
     const std::vector<DevicePairBuffer>& worker_buffers,
-    int aggregator_device_id
+    int aggregator_device_id,
+    GpuMemoryTracker* memory_tracker
 ) {
     using Clock = std::chrono::high_resolution_clock;
 
@@ -222,6 +224,9 @@ GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
         &d_all_pairs,
         static_cast<size_t>(result.inputCount) * sizeof(MeshQueryResult)
     ));
+    if (memory_tracker) {
+        memory_tracker->sample("global_dedup_after_all_pairs_alloc");
+    }
 
     auto gather_start = Clock::now();
     long long offset = 0;
@@ -258,6 +263,9 @@ GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
         offset += buffer.count;
     }
     CUDA_CHECK(cudaSetDevice(aggregator_device_id));
+    if (memory_tracker) {
+        memory_tracker->sample("global_dedup_after_gather", true);
+    }
     result.gatherUs = std::chrono::duration_cast<std::chrono::microseconds>(
         Clock::now() - gather_start
     ).count();
@@ -271,6 +279,9 @@ GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
         d_all_pairs
     );
     result.d_uniquePairs = d_all_pairs;
+    if (memory_tracker) {
+        memory_tracker->sample("global_dedup_after_sort_unique", true);
+    }
     result.dedupUs = std::chrono::duration_cast<std::chrono::microseconds>(
         Clock::now() - dedup_start
     ).count();

@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--track-overflow", action="store_true")
     parser.add_argument("--enable-profiling-stats", action="store_true")
     parser.add_argument("--include-overlap-pairs", action="store_true")
+    parser.add_argument("--num-gpus", type=int, default=1)
     args = parser.parse_args()
 
     queries = resolve_queries(args.queries, args.approaches)
@@ -80,6 +81,7 @@ def main():
         intersection_mode=args.intersection_mode,
         include_overlap_pairs=args.include_overlap_pairs,
         overlap_max_iterations=int(args.overlap_max_iterations),
+        num_gpus=args.num_gpus,
     )
 
     intersection_extra_args = build_intersection_extra_args(
@@ -141,6 +143,13 @@ def main():
         x_axis_label="Dataset case",
     )
 
+    active_gpu_counts = []
+    for row in results:
+        for query in queries:
+            item = row.get(query)
+            if isinstance(item, dict) and isinstance(item.get("num_gpus_active"), (int, float)):
+                active_gpu_counts.append(int(item["num_gpus_active"]))
+
     payload = {
         "metadata": {
             "scenario": "microns_query_comparison",
@@ -166,6 +175,9 @@ def main():
             "track_overflow": args.track_overflow,
             "enable_profiling_stats": args.enable_profiling_stats,
             "include_overlap_pairs": args.include_overlap_pairs,
+            "num_gpus_requested": args.num_gpus,
+            "num_gpus_active": max(active_gpu_counts, default=None),
+            "timing_policy": "steady_query_v1",
             "shared_data_root": str(shared_dirs["root"]),
         },
         "results": results,

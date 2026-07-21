@@ -23,6 +23,8 @@ class FigureSpec:
     source_pattern: str
     revisualize_script: Path | None = None
     required_dataset_profile: str | None = None
+    require_nonempty_results: bool = False
+    required_approaches: tuple[str, ...] = ()
 
 
 FIGURES = [
@@ -40,6 +42,8 @@ FIGURES = [
         source_pattern="figures/mesh_overlap_nu_scalability_scaling.pdf",
         revisualize_script=SCRIPT_DIR / "overlap" / "run_nu_scalability.py",
         required_dataset_profile="large_nu_v",
+        require_nonempty_results=True,
+        required_approaches=("direct_estimation", "cgal", "touch", "tdbase"),
     ),
     FigureSpec(
         output_name="mesh_overlap_overall_performance.pdf",
@@ -52,7 +56,7 @@ FIGURES = [
         output_name="mesh_query_comparison_overall_performance.pdf",
         runs_dir=SCRIPT_DIR / "predicates" / "runs",
         run_prefix="query_comparison_overall_performance_",
-        source_pattern="figures/mesh_query_comparison_overall_performance_*.pdf",
+        source_pattern="figures/predicate_comparison_overall_performance_*.pdf",
         revisualize_script=SCRIPT_DIR / "predicates" / "plot_overall_performance.py",
     ),
     FigureSpec(
@@ -63,6 +67,53 @@ FIGURES = [
         revisualize_script=SCRIPT_DIR / "overlap" / "visualize_selectivity_test.py",
     ),
 ]
+
+
+def _payload_has_nonempty_results(payload: dict) -> bool:
+    results = payload.get("results")
+    if isinstance(results, dict):
+        for value in results.values():
+            if not isinstance(value, dict):
+                continue
+            means = value.get("mean")
+            if isinstance(means, list) and any(v is not None for v in means):
+                return True
+        return False
+
+    if isinstance(results, list):
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            for value in row.values():
+                if not isinstance(value, dict):
+                    continue
+                if value.get("error"):
+                    continue
+                mean = value.get("mean")
+                if isinstance(mean, (int, float)):
+                    return True
+        return False
+
+    return False
+
+
+def _payload_has_required_approaches(payload: dict, required_approaches: tuple[str, ...]) -> bool:
+    if not required_approaches:
+        return True
+
+    results = payload.get("results")
+    if not isinstance(results, dict):
+        return False
+
+    for approach in required_approaches:
+        value = results.get(approach)
+        if not isinstance(value, dict):
+            return False
+        means = value.get("mean")
+        if not isinstance(means, list) or not any(v is not None for v in means):
+            return False
+
+    return True
 
 
 def newest_matching_files(spec: FigureSpec) -> tuple[Path, Path | None, Path | None]:
@@ -86,6 +137,10 @@ def newest_matching_files(spec: FigureSpec) -> tuple[Path, Path | None, Path | N
                 continue
             dataset_profile = (payload.get("metadata") or {}).get("dataset_profile")
             if dataset_profile != spec.required_dataset_profile:
+                continue
+            if spec.require_nonempty_results and not _payload_has_nonempty_results(payload):
+                continue
+            if not _payload_has_required_approaches(payload, spec.required_approaches):
                 continue
 
         # For overall performance, the pattern matches a file in figures/

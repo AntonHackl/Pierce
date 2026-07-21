@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 #include <vector>
 
+class GpuMemoryTracker;
+
 struct DevicePairBuffer {
     int deviceId = 0;
     MeshQueryResult* d_pairs = nullptr;
@@ -21,7 +23,8 @@ struct GpuGlobalDedupResult {
 
 GpuGlobalDedupResult gather_and_deduplicate_pairs_gpu(
     const std::vector<DevicePairBuffer>& worker_buffers,
-    int aggregator_device_id
+    int aggregator_device_id,
+    GpuMemoryTracker* memory_tracker = nullptr
 );
 
 extern "C" {

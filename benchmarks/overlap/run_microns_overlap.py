@@ -45,7 +45,8 @@ def main():
     parser.add_argument("--grid-cell-size", type=float, default=700.0)
     parser.add_argument("--overlap-max-iterations", type=int, default=100)
     parser.add_argument("--track-hash-contention", action="store_true", help="Enable overlap hash contention tracking for Pierce direct estimation")
-    parser.add_argument("--query-direction", type=str, default="both", choices=["both", "mesh1tomesh2", "mesh2tomesh1"])
+    parser.add_argument("--query-direction", type=str, default="both", choices=["both", "mesh1_to_mesh2", "mesh2_to_mesh1"])
+    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs/slabs for Pierce direct_estimation")
     parser.add_argument("--approaches", type=str, nargs="+", default=["direct_estimation", "cgal", "touch"],
                         help="Approaches to run")
     args = parser.parse_args()
@@ -66,6 +67,7 @@ def main():
             str(PIERCE_DIR), mode="direct_estimation", preprocessed_dir=str(dirs["preprocessed"]),
             timings_dir=str(dirs["timings"]), grid_cell_size=args.grid_cell_size, warmup_runs=args.warmup_runs,
             track_hash_contention=args.track_hash_contention,
+            num_gpus=args.num_gpus,
         )
     if "cgal" in args.approaches:
         adapters["cgal"] = CGALAdapter(str(CGAL_DIR), preprocessed_dir=str(dirs["preprocessed"]), threads=args.threads, grid_cell_size=args.grid_cell_size)
@@ -88,6 +90,7 @@ def main():
                  pre_adapter = PierceAdapter(
                      str(PIERCE_DIR), mode="direct_estimation", preprocessed_dir=str(dirs["preprocessed"]),
                      timings_dir=str(dirs["timings"]), grid_cell_size=args.grid_cell_size,
+                     num_gpus=args.num_gpus,
                  )
              for file_path in (agg_a, agg_b):
                  if not pre_adapter.check_preprocessed(str(file_path)):

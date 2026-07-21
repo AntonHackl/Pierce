@@ -6,6 +6,13 @@ import numpy as np
 from typing import Dict, Any, Optional
 from pathlib import Path
 from benchmarks.common.adapters.base import IntersectionBenchmarkAdapter, run_command_streaming
+from benchmarks.common.pierce_preprocessed import is_current_binary_geometry
+from benchmarks.common.pierce_timing import (
+    TIMING_POLICY,
+    aggregate_breakdowns,
+    phase_values_from_json,
+    summarize_pierce_timing,
+)
 
 
 class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
@@ -17,6 +24,7 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         timings_dir: str = "timings",
         grid_cell_size: int = 10,
         warmup_runs: int = 2,
+        num_gpus: int = 1,
     ):
         normalized_mode = "estimated" if mode == "two_pass" else mode
         super().__init__(f"Pierce_{normalized_mode}")
@@ -26,6 +34,7 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         self.timings_dir = Path(timings_dir)
         self.grid_cell_size = grid_cell_size
         self.warmup_runs = warmup_runs
+        self.num_gpus = num_gpus
 
         self.timings_dir.mkdir(parents=True, exist_ok=True)
         self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
@@ -45,7 +54,11 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         return self.preprocessed_dir / f"{input_path.stem}_g{grid_token}.pre"
 
     def check_preprocessed(self, file_path: str) -> bool:
-        return self._get_preprocessed_path(file_path).exists()
+        preprocessed_path = self._get_preprocessed_path(file_path)
+        return preprocessed_path.exists() and is_current_binary_geometry(
+            preprocessed_path,
+            self.pierce_dir.parent,
+        )
 
     def preprocess_from_source(self, source_file: str, dt_file: str, log_dir: Optional[str] = None):
         source_path = Path(source_file)
@@ -95,6 +108,8 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
 
         runtimes = []
         breakdown_accum = {}
+        overhead_breakdowns = []
+        active_gpu_counts = []
         num_obj1 = 0
         num_obj2 = 0
         num_intersections = 0
@@ -111,20 +126,6 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
             adapter_log_dir = Path(log_dir) / self.name
             adapter_log_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.mode == "estimated":
-            expected_prefixes = [
-                "selectivity estimation",
-                "raytrace_hash_",
-                "raytrace_overlap_hash_",
-                "raytrace_containment_hash_",
-                "execute hash query",
-                "download results",
-                "query",
-                "compact_hash_table_pairs",
-            ]
-        else:
-            expected_prefixes = ["selectivity estimation"]
-
         for run_idx in range(num_runs):
             json_output = self.timings_dir / f"timing_{self.mode}_{int(time.time())}_{run_idx}.json"
 
@@ -137,6 +138,8 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
 
             if extra_args:
                 cmd.extend(extra_args)
+            if self.mode == "estimated" and (not extra_args or "--num-gpus" not in extra_args):
+                cmd.extend(["--num-gpus", str(self.num_gpus)])
 
             if self.mode == "estimate_only":
                 cmd.append("--estimate-only")
@@ -199,51 +202,28 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
                 with open(json_output, 'r') as f:
                     data = json.load(f)
 
-                phases = data.get("phases", {})
                 counters = data.get("counters", {})
-                phase_values = {}
-                for key, phase_data in phases.items():
-                    normalized_key = re.sub(r"_\d+$", "", key.lower())
-                    phase_values[normalized_key] = phase_values.get(normalized_key, 0.0) + phase_data.get("duration_ms", 0.0)
+                phase_values = phase_values_from_json(data)
                 gpu_memory_peak_used_bytes = int(counters.get("gpu_memory_peak_used_bytes", gpu_memory_peak_used_bytes))
                 gpu_memory_peak_free_bytes = int(counters.get("gpu_memory_peak_free_bytes", gpu_memory_peak_free_bytes))
                 gpu_memory_total_bytes = int(counters.get("gpu_memory_total_bytes", gpu_memory_total_bytes))
 
-                has_detailed_raytrace = any(k.startswith("raytrace_") for k in phase_values.keys())
+                try:
+                    timing = summarize_pierce_timing(
+                        data,
+                        include_global_dedup=True,
+                        require_worker_counters=(self.mode == "estimated"),
+                    )
+                except ValueError as exc:
+                    return {"error": f"{exc} in {json_output}"}
 
-                if self.mode == "estimated":
-                    # Sum all relevant phases to get the total query time.
-                    # This ensures that query_time and breakdown sum are always identical.
-                    components = [
-                        "selectivity estimation",
-                        "raytrace_hash_mesh1tomesh2",
-                        "raytrace_hash_mesh2tomesh1",
-                        "raytrace_overlap_hash_mesh1tomesh2",
-                        "raytrace_overlap_hash_mesh2tomesh1",
-                        "raytrace_containment_hash_mesh1tomesh2",
-                        "raytrace_containment_hash_mesh2tomesh1",
-                        "compact_hash_table_pairs",
-                        "download results",
-                    ]
-                    query_time = sum(phase_values.get(c, 0.0) for c in components)
-                else:
-                    query_time = phase_values.get("selectivity estimation", 0.0)
+                for phase, duration in timing.breakdown.items():
+                    breakdown_accum.setdefault(phase, []).append(duration)
+                overhead_breakdowns.append(timing.overhead_breakdown)
+                if timing.num_gpus_active is not None:
+                    active_gpu_counts.append(timing.num_gpus_active)
 
-                found = query_time > 0.0
-
-                for normalized_key, duration in phase_values.items():
-                    if not any(normalized_key.startswith(prefix) for prefix in expected_prefixes):
-                        continue
-                    if has_detailed_raytrace and normalized_key in ("query", "execute hash query"):
-                        continue
-                    if normalized_key not in breakdown_accum:
-                        breakdown_accum[normalized_key] = []
-                    breakdown_accum[normalized_key].append(duration)
-
-                if not found:
-                    return {"error": f"Expected timing phases not found in {json_output}"}
-
-                runtimes.append(query_time)
+                runtimes.append(timing.query_time_ms)
 
             except subprocess.TimeoutExpired:
                 print(f"[{self.name}] Timeout reached ({timeout}s)")
@@ -262,6 +242,7 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         breakdown_stats = {}
         for phase, times in breakdown_accum.items():
             breakdown_stats[phase] = np.mean(times)
+        overhead_breakdown = aggregate_breakdowns(overhead_breakdowns)
 
         return {
             "mean": np.mean(runtimes),
@@ -270,6 +251,10 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
             "std": np.std(runtimes),
             "raw_times": runtimes,
             "breakdown": breakdown_stats,
+            "overhead_breakdown": overhead_breakdown,
+            "timing_policy": TIMING_POLICY,
+            "num_gpus_requested": self.num_gpus,
+            "num_gpus_active": max(active_gpu_counts) if active_gpu_counts else None,
             "num_obj1": num_obj1,
             "num_obj2": num_obj2,
             "num_intersections": num_intersections,

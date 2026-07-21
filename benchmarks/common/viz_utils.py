@@ -1,27 +1,8 @@
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib import font_manager
 import numpy as np
 from pathlib import Path
-
-
-def _register_matplotlib_cm_fonts():
-    font_dir = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
-    for font_name in (
-        "cmr10.ttf",
-        "cmb10.ttf",
-        "cmmi10.ttf",
-        "cmsy10.ttf",
-        "cmex10.ttf",
-        "cmtt10.ttf",
-    ):
-        font_path = font_dir / font_name
-        if font_path.exists():
-            font_manager.fontManager.addfont(str(font_path))
-
-
-_register_matplotlib_cm_fonts()
 
 PAPER_FIGSIZE = (10.0, 7.2)
 PAPER_WIDE_FIGSIZE = PAPER_FIGSIZE
@@ -56,11 +37,10 @@ HATCH_PATTERNS = ["/", "\\", "x", "-", "+", ".", "o", "*"]
 
 def apply_paper_style():
     plt.rcParams.update({
-        "font.family": "serif",
-        "font.serif": ["cmb10", "cmr10"],
+        "font.family": "sans-serif",
         "font.weight": "bold",
         "font.size": 16,
-        "mathtext.fontset": "cm",
+        "mathtext.fontset": "dejavusans",
         "axes.formatter.use_mathtext": True,
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
@@ -229,6 +209,9 @@ def generate_breakdown_figure(results, approaches, figures_dir: Path, timestamp:
         # Preferred intersection phase order (bottom -> top in stacked bars).
         phase_order = [
             "selectivity estimation",
+            "measured hash/raytrace query",
+            "hash compaction/result movement",
+            "global gpu deduplication",
             "raytrace_overlap_hash_mesh1tomesh2",
             "raytrace_overlap_hash_mesh2tomesh1",
             "raytrace_containment_hash_mesh1tomesh2",
@@ -237,6 +220,9 @@ def generate_breakdown_figure(results, approaches, figures_dir: Path, timestamp:
         ]
         phase_labels = {
             "selectivity estimation": "Selectivity Estimation",
+            "measured hash/raytrace query": "Hash/Ray Query",
+            "hash compaction/result movement": "Compaction/Move",
+            "global gpu deduplication": "Global Dedup",
             "raytrace_overlap_hash_mesh1tomesh2": "Edge (M1->M2)",
             "raytrace_overlap_hash_mesh2tomesh1": "Edge (M2 -> M1)",
             "raytrace_containment_hash_mesh1tomesh2": "Containment (M1-M2)",

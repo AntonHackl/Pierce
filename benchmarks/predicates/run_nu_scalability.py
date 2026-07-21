@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--enable-profiling-stats", action="store_true")
     parser.add_argument("--include-overlap-pairs", action="store_true")
     parser.add_argument("--track-gpu-memory", action="store_true")
+    parser.add_argument("--num-gpus", type=int, default=1)
     args = parser.parse_args()
     forced_nu_counts = _forced_nu_counts_for_profile(args.dataset_profile)
     if args.nu != forced_nu_counts:
@@ -107,6 +108,7 @@ def main():
         include_overlap_pairs=args.include_overlap_pairs,
         track_gpu_memory=args.track_gpu_memory,
         overlap_max_iterations=int(args.overlap_max_iterations),
+        num_gpus=args.num_gpus,
     )
 
     intersection_extra_args = build_intersection_extra_args(
@@ -184,6 +186,13 @@ def main():
             x_axis_label="Dataset case",
         )
 
+        active_gpu_counts = []
+        for row in results:
+            for query in queries:
+                item = row.get(query)
+                if isinstance(item, dict) and isinstance(item.get("num_gpus_active"), (int, float)):
+                    active_gpu_counts.append(int(item["num_gpus_active"]))
+
         payload = {
             "metadata": {
                 "scenario": "nu_scalability",
@@ -211,6 +220,9 @@ def main():
                 "enable_profiling_stats": args.enable_profiling_stats,
                 "include_overlap_pairs": args.include_overlap_pairs,
                 "track_gpu_memory": args.track_gpu_memory,
+                "num_gpus_requested": args.num_gpus,
+                "num_gpus_active": max(active_gpu_counts, default=None),
+                "timing_policy": "steady_query_v1",
                 "shared_data_root": str(shared_dirs["root"]),
                 "isolated_data_root": str(isolated_data_dirs["root"]),
             },
