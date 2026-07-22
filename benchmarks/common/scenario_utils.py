@@ -61,6 +61,8 @@ def canonical_cube_pair_paths(
     selectivity: float,
     seed: int,
     grid_cell_size: int | None = None,
+    universe_overlap_fraction: float = 1.0,
+    translation_axis: str = "x",
 ) -> Tuple[Path, Path]:
     min_tok = sanitize_float_token(min_size)
     max_tok = sanitize_float_token(max_size)
@@ -69,6 +71,9 @@ def canonical_cube_pair_paths(
         f"cubes_na{num_cubes_a}_nb{num_cubes_b}_"
         f"min{min_tok}_max{max_tok}_sel{sel_tok}_seed{seed}"
     )
+    if universe_overlap_fraction != 1.0:
+        overlap_tok = sanitize_float_token(universe_overlap_fraction)
+        stem += f"_uo{overlap_tok}_axis{translation_axis}"
     if grid_cell_size is not None:
         stem += f"_g{grid_cell_size}"
     return raw_dir / f"{stem}_a.obj", raw_dir / f"{stem}_b.obj"
@@ -129,11 +134,18 @@ def canonical_nn_pair_paths(
     return n_file1, n_file2
 
 
-def compute_universe_for_selectivity(target_selectivity: float, min_size: float, max_size: float) -> float:
+def compute_universe_for_selectivity(
+    target_selectivity: float,
+    min_size: float,
+    max_size: float,
+    universe_overlap_fraction: float = 1.0,
+) -> float:
     if target_selectivity <= 0:
         raise ValueError("Target selectivity must be positive")
+    if universe_overlap_fraction <= 0 or universe_overlap_fraction > 1:
+        raise ValueError("Universe overlap fraction must be in (0, 1]")
     avg_size = (min_size + max_size) / 2.0
-    return (2.0 * avg_size) / (target_selectivity ** (1.0 / 3.0))
+    return 2.0 * avg_size * ((universe_overlap_fraction / target_selectivity) ** (1.0 / 3.0))
 
 
 def get_shared_data_dirs(scenario_name: str) -> Dict[str, Path]:
@@ -195,6 +207,8 @@ def ensure_cube_pair_dataset(
     max_size: float,
     selectivity: float,
     seed: int,
+    universe_overlap_fraction: float = 1.0,
+    translation_axis: str = "x",
     python_executable: str = sys.executable,
 ) -> Tuple[Path, Path]:
     if output_a.exists() and output_b.exists():
@@ -212,6 +226,11 @@ def ensure_cube_pair_dataset(
         "--output-b", str(output_b),
         "--seed", str(seed),
     ]
+    if universe_overlap_fraction != 1.0:
+        cmd.extend([
+            "--universe-overlap-fraction", str(universe_overlap_fraction),
+            "--translation-axis", translation_axis,
+        ])
     run_cmd(cmd, f"Generating cubes (nA={num_cubes_a}, nB={num_cubes_b}, sel={selectivity})")
     return output_a, output_b
 

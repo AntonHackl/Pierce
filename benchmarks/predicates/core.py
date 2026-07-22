@@ -111,6 +111,7 @@ def build_pierce_query_adapters(
     track_gpu_memory: bool = False,
     overlap_max_iterations: int = 100,
     num_gpus: int = 1,
+    overlap_hash_table_size: int | None = None,
 ) -> Dict[str, Any]:
     pierce_dir = repo_root / "pierce"
 
@@ -124,6 +125,7 @@ def build_pierce_query_adapters(
         overlap_max_iterations=overlap_max_iterations,
         track_gpu_memory=track_gpu_memory,
         num_gpus=num_gpus,
+        hash_table_size=overlap_hash_table_size,
     )
     intersection = PierceIntersectionAdapter(
         str(pierce_dir),

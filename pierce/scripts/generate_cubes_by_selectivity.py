@@ -16,15 +16,15 @@ sys.path.append(str(Path(__file__).parent))
 from generate_test_cubes import generate_cube_vertices, generate_cube_faces, write_obj_file
 
 
-def compute_universe_for_selectivity(target_selectivity, min_size, max_size):
+def compute_universe_for_selectivity(target_selectivity, min_size, max_size, universe_overlap_fraction=1.0):
     """
     Compute universe extent (assuming cubic universe) to achieve target selectivity.
     
     For overlap (excluding containment), the selectivity approximately follows:
-        selectivity ≈ [(2 * avg_size) / U]^3
+        selectivity ≈ overlap_fraction * [(2 * avg_size) / U]^3
     
     Solving for U:
-        U ≈ (2 * avg_size) / selectivity^(1/3)
+        U ≈ 2 * avg_size * (overlap_fraction / selectivity)^(1/3)
     
     Returns:
         Universe extent U (same for all dimensions)
@@ -36,8 +36,10 @@ def compute_universe_for_selectivity(target_selectivity, min_size, max_size):
     
     if target_selectivity <= 0:
         raise ValueError("Target selectivity must be positive")
+    if universe_overlap_fraction <= 0 or universe_overlap_fraction > 1:
+        raise ValueError("Universe overlap fraction must be in (0, 1]")
     
-    universe_extent = (2.0 * avg_size) / (target_selectivity ** (1.0/3.0))
+    universe_extent = 2.0 * avg_size * ((universe_overlap_fraction / target_selectivity) ** (1.0/3.0))
     
     return universe_extent
 
@@ -164,6 +166,7 @@ def write_obj_file_streaming(
     extent: float,
     seed: Optional[int],
     reservoir_size: int,
+    translation: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     progress_every: int = 100000,
 ) -> List[BBox]:
     """Stream-generate cubes directly into an OBJ, while keeping a reservoir sample of bboxes."""
@@ -181,9 +184,9 @@ def write_obj_file_streaming(
         vertex_offset = 0
 
         for i in range(num_cubes):
-            center_x = random.uniform(0, extent)
-            center_y = random.uniform(0, extent)
-            center_z = random.uniform(0, extent)
+            center_x = random.uniform(0, extent) + translation[0]
+            center_y = random.uniform(0, extent) + translation[1]
+            center_z = random.uniform(0, extent) + translation[2]
             size = random.uniform(min_size, max_size)
             half = size / 2.0
 
@@ -214,7 +217,14 @@ def write_obj_file_streaming(
     return reservoir
 
 
-def generate_random_cube_data(num_cubes, min_size, max_size, extent, seed=None):
+def generate_random_cube_data(
+    num_cubes,
+    min_size,
+    max_size,
+    extent,
+    seed=None,
+    translation: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+):
     """Generate random cube data within cubic extent."""
     if seed is not None:
         random.seed(seed)
@@ -223,9 +233,9 @@ def generate_random_cube_data(num_cubes, min_size, max_size, extent, seed=None):
     cube_faces = generate_cube_faces()
     
     for i in range(num_cubes):
-        center_x = random.uniform(0, extent)
-        center_y = random.uniform(0, extent)
-        center_z = random.uniform(0, extent)
+        center_x = random.uniform(0, extent) + translation[0]
+        center_y = random.uniform(0, extent) + translation[1]
+        center_z = random.uniform(0, extent) + translation[2]
         size = random.uniform(min_size, max_size)
         
         vertices = generate_cube_vertices(center_x, center_y, center_z, size)
@@ -256,6 +266,10 @@ def main():
                         help='Output path for dataset B')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    parser.add_argument('--universe-overlap-fraction', type=float, default=1.0,
+                        help='Fraction of the two cubic universes that overlap along the translation axis')
+    parser.add_argument('--translation-axis', choices=['x', 'y', 'z'], default='x',
+                        help='Axis used to translate dataset B when universe overlap is below 1.0')
     parser.add_argument('--verify-samples', type=int, default=100000,
                         help='Number of samples for verification (default: 100000)')
     parser.add_argument('--streaming-threshold', type=int, default=250000,
@@ -276,15 +290,31 @@ def main():
         parser.error("Minimum size cannot be greater than maximum size")
     if args.selectivity <= 0 or args.selectivity > 1:
         parser.error("Selectivity must be between 0 and 1")
+    if args.universe_overlap_fraction <= 0 or args.universe_overlap_fraction > 1:
+        parser.error("Universe overlap fraction must be in (0, 1]")
     
     # Compute universe extent
     print(f"Computing universe extent for target selectivity {args.selectivity:.6f}...")
-    universe_extent = compute_universe_for_selectivity(args.selectivity, args.min_size, args.max_size)
+    universe_extent = compute_universe_for_selectivity(
+        args.selectivity,
+        args.min_size,
+        args.max_size,
+        args.universe_overlap_fraction,
+    )
+    shift = (1.0 - args.universe_overlap_fraction) * universe_extent
+    translation_b = {
+        'x': (shift, 0.0, 0.0),
+        'y': (0.0, shift, 0.0),
+        'z': (0.0, 0.0, shift),
+    }[args.translation_axis]
     
     print(f"\n{'=' * 60}")
     print(f"COMPUTED UNIVERSE EXTENT:")
     print(f"{'=' * 60}")
     print(f"  Target Selectivity:    {args.selectivity:.8f}")
+    print(f"  Universe Overlap:      {args.universe_overlap_fraction:.4f}")
+    print(f"  Translation Axis:      {args.translation_axis}")
+    print(f"  Dataset B Translation: ({translation_b[0]:.2f}, {translation_b[1]:.2f}, {translation_b[2]:.2f})")
     print(f"  Cube Size Range:       [{args.min_size}, {args.max_size}]")
     print(f"  Average Cube Size:     {(args.min_size + args.max_size)/2:.2f}")
     print(f"  Computed Universe:     {universe_extent:.2f} × {universe_extent:.2f} × {universe_extent:.2f}")
@@ -328,6 +358,7 @@ def main():
             universe_extent,
             seed_b,
             reservoir_size=args.reservoir_size,
+            translation=translation_b,
             progress_every=args.progress_every,
         )
         print(f"Successfully wrote {args.num_cubes_b:,} cubes")
@@ -351,7 +382,8 @@ def main():
             args.min_size,
             args.max_size,
             universe_extent,
-            seed_b
+            seed_b,
+            translation=translation_b,
         )
 
         # Verify with sampling ON THE GENERATED DATA
@@ -393,6 +425,7 @@ def main():
     print(f"GENERATION COMPLETE!")
     print(f"{'=' * 60}")
     print(f"Universe: [0, {universe_extent:.2f}]³")
+    print(f"Dataset B translation: ({translation_b[0]:.2f}, {translation_b[1]:.2f}, {translation_b[2]:.2f})")
     print(f"Dataset A: {output_path_a}")
     print(f"Dataset B: {output_path_b}")
     print(f"{'=' * 60}")

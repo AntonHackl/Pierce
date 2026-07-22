@@ -38,6 +38,36 @@ from benchmarks.predicates.core import (
 
 LEGACY_OVERLAP_RAW_DIR = REPO_ROOT / "benchmarks" / "overlap" / "data" / "raw"
 DEFAULT_QUERIES = ["overlap", "intersection"]
+DEFAULT_DATASETS = [
+    "cube_200k_vs_1m",
+    "cube_translated_uo50_200k_vs_800k",
+    "nuclei_vessel_nu800",
+    "microns_8gb",
+    "microns_16gb",
+]
+MICRONS_HASH_TABLE_OVERRIDES = {
+    8: {
+        "true_pairs": 636,
+        "estimated_pairs": 5,
+    },
+    16: {
+        # The 16 GB two-GPU run produced 3,481 slab-local pairs before global
+        # deduplication.  Use 16,384 global slots, i.e. 8,192 per slab, so a
+        # skewed slab remains well below saturation.
+        "true_pairs": 8192,
+        "estimated_pairs": 22,
+    },
+}
+
+
+def _hash_table_slots_for_pairs(true_pairs: int) -> int:
+    return int(true_pairs / 0.5)
+
+
+def _hash_load_factor_for_target_slots(estimated_pairs: int, target_slots: int) -> float:
+    if estimated_pairs <= 0:
+        return 0.5
+    return estimated_pairs / target_slots
 
 
 def _error_row(label: str, exc: Exception, *, stage: str, gpu_count: int | None = None) -> dict[str, Any]:
@@ -88,6 +118,45 @@ def _prepare_cube() -> tuple[str, Path, Path, float, dict[str, Any]]:
     return "cube_200k_vs_1m", mesh1, mesh2, 5.0, meta
 
 
+def _prepare_translated_cube() -> tuple[str, Path, Path, float, dict[str, Any]]:
+    dirs = get_shared_data_dirs("cube_translated_overlap")
+    mesh1, mesh2 = canonical_cube_pair_paths(
+        dirs["raw"],
+        num_cubes_a=200_000,
+        num_cubes_b=800_000,
+        min_size=1.0,
+        max_size=2.0,
+        selectivity=0.001,
+        seed=42,
+        grid_cell_size=5.0,
+        universe_overlap_fraction=0.50,
+        translation_axis="x",
+    )
+    ensure_cube_pair_dataset(
+        mesh1,
+        mesh2,
+        num_cubes_a=200_000,
+        num_cubes_b=800_000,
+        min_size=1.0,
+        max_size=2.0,
+        selectivity=0.001,
+        seed=42,
+        universe_overlap_fraction=0.50,
+        translation_axis="x",
+    )
+    meta = {
+        "scenario": "cube_translated_overlap",
+        "description": "translated uniform cube pair with 50% universe overlap",
+        "num_cubes_a": 200_000,
+        "num_cubes_b": 800_000,
+        "selectivity": 0.001,
+        "universe_overlap_fraction": 0.50,
+        "translation_axis": "x",
+        "shared_data_root": str(dirs["root"]),
+    }
+    return "cube_translated_uo50_200k_vs_800k", mesh1, mesh2, 5.0, meta
+
+
 def _prepare_nuclei_vessel() -> tuple[str, Path, Path, float, dict[str, Any]]:
     dirs = get_shared_data_dirs("large_nu_nn_scalability")
     nuclei, vessel = canonical_nu_pair_paths(
@@ -125,6 +194,19 @@ def _prepare_microns(
         "source_root": str(source_root),
         "shared_data_root": str(dirs["root"]),
     }
+    if size_gb in MICRONS_HASH_TABLE_OVERRIDES:
+        override = MICRONS_HASH_TABLE_OVERRIDES[size_gb]
+        hash_table_slots = _hash_table_slots_for_pairs(override["true_pairs"])
+        meta.update({
+            "hash_table_override_reason": "observed true pairs at load factor 0.5",
+            "hash_table_true_pairs": override["true_pairs"],
+            "hash_table_estimated_pairs": override["estimated_pairs"],
+            "overlap_hash_table_size": hash_table_slots,
+            "intersection_hash_load_factor": _hash_load_factor_for_target_slots(
+                override["estimated_pairs"],
+                hash_table_slots,
+            ),
+        })
     return f"microns_{size_gb}gb", mesh1, mesh2, 700.0, meta
 
 
@@ -151,10 +233,12 @@ def _run_case(
         track_gpu_memory=args.track_gpu_memory,
         overlap_max_iterations=args.overlap_max_iterations,
         num_gpus=gpu_count,
+        overlap_hash_table_size=dataset_meta.get("overlap_hash_table_size"),
     )
+    intersection_hash_load_factor = dataset_meta.get("intersection_hash_load_factor", args.hash_load_factor)
     intersection_extra_args = build_intersection_extra_args(
         overlap_max_iterations=args.overlap_max_iterations,
-        hash_load_factor=args.hash_load_factor,
+        hash_load_factor=intersection_hash_load_factor,
         enable_profiling_stats=args.enable_profiling_stats,
         track_overflow=args.track_overflow,
         track_gpu_memory=args.track_gpu_memory,
@@ -246,6 +330,115 @@ def _write_runtime_plot(
     if not ok_rows:
         return
 
+    datasets = sorted({row["dataset"] for row in ok_rows})
+    speedups: dict[str, dict[str, float]] = {query: {} for query in queries}
+    palette = {
+        "overlap": "#2F6F73",
+        "intersection": "#D18C2D",
+    }
+
+    for dataset in datasets:
+        for query in queries:
+            single_mean = None
+            multi_mean = None
+            for row in ok_rows:
+                if row["dataset"] != dataset:
+                    continue
+                mean = row["queries"].get(query, {}).get("mean")
+                if not isinstance(mean, (int, float)) or mean <= 0:
+                    continue
+                if row.get("gpu_count") == 1:
+                    single_mean = float(mean)
+                elif multi_mean is None or row.get("gpu_count", 0) > 1:
+                    multi_mean = float(mean)
+            if single_mean is not None and multi_mean is not None:
+                speedups[query][dataset] = single_mean / multi_mean
+
+    comparable_datasets = [
+        dataset for dataset in datasets
+        if any(dataset in query_speedups for query_speedups in speedups.values())
+    ]
+    if not comparable_datasets:
+        runtime_bars = [
+            (row["dataset"], query, row.get("gpu_count"), float(mean))
+            for row in ok_rows
+            for query in queries
+            if isinstance((mean := row["queries"].get(query, {}).get("mean")), (int, float)) and mean > 0
+        ]
+        if not runtime_bars:
+            return
+        fig, ax = plt.subplots(figsize=(max(5.0, len(runtime_bars) * 1.4), 4.5))
+        bars = ax.bar(
+            range(len(runtime_bars)),
+            [mean for _, _, _, mean in runtime_bars],
+            color=[palette.get(query, "#5F6C7B") for _, query, _, _ in runtime_bars],
+        )
+        for bar, (_, _, _, mean) in zip(bars, runtime_bars):
+            ax.text(bar.get_x() + bar.get_width() / 2.0, mean, f"{mean:.1f} ms", ha="center", va="bottom", fontsize=8)
+        ax.set_ylabel("Mean query runtime (ms)")
+        ax.set_xticks(range(len(runtime_bars)))
+        ax.set_xticklabels(
+            [f"{dataset}\n{query}\n{gpu_count} GPU" for dataset, query, gpu_count, _ in runtime_bars],
+        )
+        ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(pdf_path)
+        fig.savefig(png_path, dpi=300)
+        plt.close(fig)
+        return
+
+    x_positions = list(range(len(comparable_datasets)))
+    active_queries = [query for query in queries if speedups.get(query)]
+    bar_width = min(0.35, 0.8 / max(1, len(active_queries)))
+    fig, ax = plt.subplots(figsize=(max(8.0, len(comparable_datasets) * 2.4), 5.0))
+
+    for query_index, query in enumerate(active_queries):
+        offset = (query_index - (len(active_queries) - 1) / 2.0) * bar_width
+        values = [speedups[query].get(dataset, 0.0) for dataset in comparable_datasets]
+        bars = ax.bar(
+            [x + offset for x in x_positions],
+            values,
+            width=bar_width,
+            label=query,
+            color=palette.get(query, "#5F6C7B"),
+        )
+        for bar, value in zip(bars, values):
+            if value > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    value,
+                    f"{value:.2f}x",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+
+    ax.axhline(1.0, color="#333333", linewidth=1.0, linestyle="--", alpha=0.7)
+    ax.set_ylabel("Multi-GPU speedup over single GPU (x)")
+    ax.set_xlabel("Dataset")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(comparable_datasets, rotation=20, ha="right")
+    ax.legend(title="Query")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(pdf_path)
+    fig.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+
+def _write_microns_16gb_runtime_plot(
+    pdf_path: Path,
+    png_path: Path,
+    rows: list[dict[str, Any]],
+    queries: list[str],
+) -> None:
+    microns_rows = [
+        row for row in rows
+        if row.get("status") == "ok" and row.get("dataset") == "microns_16gb"
+    ]
+    if not microns_rows:
+        return
+
     labels: list[str] = []
     values: list[float] = []
     colors: list[str] = []
@@ -253,25 +446,32 @@ def _write_runtime_plot(
         "overlap": "#2F6F73",
         "intersection": "#D18C2D",
     }
-
-    for row in ok_rows:
+    for row in microns_rows:
         for query in queries:
-            result = row["queries"].get(query, {})
-            mean = result.get("mean")
+            mean = row["queries"].get(query, {}).get("mean")
             if isinstance(mean, (int, float)):
-                labels.append(f"{row['dataset']}\n{query}\n{row['gpu_count']} GPU")
+                labels.append(f"{query}\n{row['gpu_count']} GPU")
                 values.append(float(mean))
                 colors.append(palette.get(query, "#5F6C7B"))
 
     if not values:
         return
 
-    width = max(10.0, len(values) * 0.85)
-    fig, ax = plt.subplots(figsize=(width, 5.0))
-    ax.bar(range(len(values)), values, color=colors)
+    fig, ax = plt.subplots(figsize=(max(5.0, len(values) * 1.4), 4.5))
+    bars = ax.bar(range(len(values)), values, color=colors)
+    for bar, value in zip(bars, values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            value,
+            f"{value:.1f} ms",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
     ax.set_ylabel("Mean query runtime (ms)")
+    ax.set_xlabel("MICRONS 16 GB query")
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.set_xticklabels(labels)
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     fig.savefig(pdf_path)
@@ -288,8 +488,11 @@ def _write_outputs(
     summary_csv = Path(run_layout["run_dir"]) / "summary.csv"
     figure_pdf = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.pdf"
     figure_png = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.png"
+    microns_16gb_figure_pdf = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.pdf"
+    microns_16gb_figure_png = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.png"
     _write_summary_csv(summary_csv, rows, args.queries)
     _write_runtime_plot(figure_pdf, figure_png, rows, args.queries)
+    _write_microns_16gb_runtime_plot(microns_16gb_figure_pdf, microns_16gb_figure_png, rows, args.queries)
 
     payload = {
         "metadata": {
@@ -301,6 +504,7 @@ def _write_outputs(
             "runs": args.runs,
             "warmup_runs": args.warmup_runs,
             "timeout_seconds": args.timeout,
+            "datasets": args.datasets,
             "queries": args.queries,
             "source_root": str(args.source_root),
             "summary_csv": str(summary_csv),
@@ -308,6 +512,10 @@ def _write_outputs(
             "runtime_figures": {
                 "pdf": str(figure_pdf),
                 "png": str(figure_png),
+            },
+            "microns_16gb_runtime_figures": {
+                "pdf": str(microns_16gb_figure_pdf),
+                "png": str(microns_16gb_figure_png),
             },
         },
         "results": rows,
@@ -326,6 +534,14 @@ def main() -> None:
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=2400.0)
     parser.add_argument("--source-root", type=Path, default=REPO_ROOT / "scripts" / "microns_data")
+    parser.add_argument("--datasets", nargs="+", choices=DEFAULT_DATASETS, default=DEFAULT_DATASETS)
+    parser.add_argument(
+        "--gpu-counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Run only these GPU-count variants (default: each dataset's standard single/multi-GPU variants).",
+    )
     parser.add_argument("--queries", nargs="+", choices=DEFAULT_QUERIES, default=DEFAULT_QUERIES)
     parser.add_argument("--overlap-query-direction", choices=["both", "mesh1_to_mesh2", "mesh2_to_mesh1"], default="both")
     parser.add_argument("--intersection-query-direction", choices=["both", "mesh1_to_mesh2", "mesh2_to_mesh1"], default="both")
@@ -340,16 +556,29 @@ def main() -> None:
 
     if args.multi_gpus <= 1:
         parser.error("--multi-gpus must be greater than 1")
+    if args.gpu_counts is not None and any(gpu_count <= 0 for gpu_count in args.gpu_counts):
+        parser.error("--gpu-counts values must be positive")
 
     run_layout = create_benchmark_run_layout(SCRIPT_DIR, "single_vs_multi_gpu")
     rows: list[dict[str, Any]] = []
 
     dataset_specs = [
         ("cube_200k_vs_1m", lambda: _prepare_cube(), [1, args.multi_gpus]),
+        ("cube_translated_uo50_200k_vs_800k", lambda: _prepare_translated_cube(), [1, args.multi_gpus]),
         ("nuclei_vessel_nu800", lambda: _prepare_nuclei_vessel(), [1, args.multi_gpus]),
         ("microns_8gb", lambda: _prepare_microns(8, source_root=args.source_root), [1, args.multi_gpus]),
         ("microns_16gb", lambda: _prepare_microns(16, source_root=args.source_root), [args.multi_gpus]),
     ]
+    selected_datasets = set(args.datasets)
+    dataset_specs = [
+        spec for spec in dataset_specs
+        if spec[0] in selected_datasets
+    ]
+    if args.gpu_counts is not None:
+        dataset_specs = [
+            (label, prepare, [gpu_count for gpu_count in gpu_counts if gpu_count in args.gpu_counts])
+            for label, prepare, gpu_counts in dataset_specs
+        ]
 
     for expected_label, prepare, gpu_counts in dataset_specs:
         try:
@@ -386,6 +615,8 @@ def main() -> None:
     summary_csv = Path(run_layout["run_dir"]) / "summary.csv"
     figure_pdf = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.pdf"
     figure_png = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.png"
+    microns_16gb_figure_pdf = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.pdf"
+    microns_16gb_figure_png = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.png"
     results_path = Path(run_layout["results_json"])
     print(f"Saved results: {results_path}")
     print(f"Saved summary: {summary_csv}")
@@ -393,6 +624,10 @@ def main() -> None:
         print(f"Saved figure PDF: {figure_pdf}")
     if figure_png.exists():
         print(f"Saved figure PNG: {figure_png}")
+    if microns_16gb_figure_pdf.exists():
+        print(f"Saved MICRONS 16 GB figure PDF: {microns_16gb_figure_pdf}")
+    if microns_16gb_figure_png.exists():
+        print(f"Saved MICRONS 16 GB figure PNG: {microns_16gb_figure_png}")
 
 
 if __name__ == "__main__":
