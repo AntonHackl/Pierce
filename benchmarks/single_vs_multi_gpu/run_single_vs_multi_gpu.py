@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
@@ -426,6 +427,82 @@ def _write_runtime_plot(
     plt.close(fig)
 
 
+def _write_query_runtime_plot(
+    pdf_path: Path,
+    png_path: Path,
+    rows: list[dict[str, Any]],
+    queries: list[str],
+) -> None:
+    """Plot the measured query times for every available dataset/query/GPU variant."""
+    palette = {
+        "overlap": "#2F6F73",
+        "intersection": "#D18C2D",
+    }
+    dataset_order = list(dict.fromkeys(
+        row["dataset"] for row in rows if row.get("status") == "ok"
+    ))
+    runtimes = {
+        (row["dataset"], query, int(row["gpu_count"])): float(mean)
+        for row in rows
+        if row.get("status") == "ok"
+        for query in queries
+        if isinstance((mean := row.get("queries", {}).get(query, {}).get("mean")), (int, float)) and mean > 0
+    }
+    if not runtimes:
+        return
+
+    gpu_counts = sorted({gpu_count for _, _, gpu_count in runtimes})
+    bar_width = min(0.20, 0.8 / max(1, len(queries) * len(gpu_counts)))
+    x_positions = list(range(len(dataset_order)))
+    total_bars = len(queries) * len(gpu_counts)
+    fig, ax = plt.subplots(figsize=(max(8.0, len(dataset_order) * 2.4), 5.5))
+    for query_index, query in enumerate(queries):
+        for gpu_index, gpu_count in enumerate(gpu_counts):
+            slot = query_index * len(gpu_counts) + gpu_index
+            offset = (slot - (total_bars - 1) / 2.0) * bar_width
+            values = [runtimes.get((dataset, query, gpu_count)) for dataset in dataset_order]
+            for x, value in zip(x_positions, values):
+                if value is None:
+                    continue
+                bar = ax.bar(
+                    x + offset,
+                    value,
+                    width=bar_width,
+                    color=palette.get(query, "#5F6C7B"),
+                    hatch="//" if gpu_count > 1 else None,
+                    edgecolor="#333333",
+                    linewidth=0.5,
+                )[0]
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    value,
+                    f"{value:.1f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    rotation=90,
+                )
+
+    ax.set_ylabel("Mean query runtime (ms)")
+    ax.set_xlabel("Dataset")
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(dataset_order, rotation=20, ha="right")
+    ax.legend(
+        handles=[
+            Patch(facecolor=palette["overlap"], edgecolor="#333333", label="Overlap"),
+            Patch(facecolor=palette["intersection"], edgecolor="#333333", label="Intersection"),
+            Patch(facecolor="white", edgecolor="#333333", label="1 GPU"),
+            Patch(facecolor="white", edgecolor="#333333", hatch="//", label="Multi-GPU"),
+        ],
+        ncols=2,
+    )
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(pdf_path)
+    fig.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+
 def _write_microns_16gb_runtime_plot(
     pdf_path: Path,
     png_path: Path,
@@ -488,10 +565,13 @@ def _write_outputs(
     summary_csv = Path(run_layout["run_dir"]) / "summary.csv"
     figure_pdf = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.pdf"
     figure_png = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.png"
+    query_runtime_pdf = Path(run_layout["figures_dir"]) / "query_runtime_by_dataset_gpu.pdf"
+    query_runtime_png = Path(run_layout["figures_dir"]) / "query_runtime_by_dataset_gpu.png"
     microns_16gb_figure_pdf = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.pdf"
     microns_16gb_figure_png = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.png"
     _write_summary_csv(summary_csv, rows, args.queries)
     _write_runtime_plot(figure_pdf, figure_png, rows, args.queries)
+    _write_query_runtime_plot(query_runtime_pdf, query_runtime_png, rows, args.queries)
     _write_microns_16gb_runtime_plot(microns_16gb_figure_pdf, microns_16gb_figure_png, rows, args.queries)
 
     payload = {
@@ -512,6 +592,10 @@ def _write_outputs(
             "runtime_figures": {
                 "pdf": str(figure_pdf),
                 "png": str(figure_png),
+            },
+            "query_runtime_figures": {
+                "pdf": str(query_runtime_pdf),
+                "png": str(query_runtime_png),
             },
             "microns_16gb_runtime_figures": {
                 "pdf": str(microns_16gb_figure_pdf),
@@ -615,6 +699,8 @@ def main() -> None:
     summary_csv = Path(run_layout["run_dir"]) / "summary.csv"
     figure_pdf = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.pdf"
     figure_png = Path(run_layout["figures_dir"]) / "runtime_by_dataset_gpu.png"
+    query_runtime_pdf = Path(run_layout["figures_dir"]) / "query_runtime_by_dataset_gpu.pdf"
+    query_runtime_png = Path(run_layout["figures_dir"]) / "query_runtime_by_dataset_gpu.png"
     microns_16gb_figure_pdf = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.pdf"
     microns_16gb_figure_png = Path(run_layout["figures_dir"]) / "microns_16gb_runtime.png"
     results_path = Path(run_layout["results_json"])
@@ -624,6 +710,10 @@ def main() -> None:
         print(f"Saved figure PDF: {figure_pdf}")
     if figure_png.exists():
         print(f"Saved figure PNG: {figure_png}")
+    if query_runtime_pdf.exists():
+        print(f"Saved query-runtime figure PDF: {query_runtime_pdf}")
+    if query_runtime_png.exists():
+        print(f"Saved query-runtime figure PNG: {query_runtime_png}")
     if microns_16gb_figure_pdf.exists():
         print(f"Saved MICRONS 16 GB figure PDF: {microns_16gb_figure_pdf}")
     if microns_16gb_figure_png.exists():
