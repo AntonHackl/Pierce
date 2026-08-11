@@ -62,7 +62,7 @@ conda env create -f pierce/preprocess/environment-linux.yml
 conda env create -f pierce/query/environment-linux.yml
 conda env create -f baselines/face/environment.yml
 conda env create -f baselines/tdbase_extensions/environment.yml
-conda env create -f benchmarks/overlap/environment.yml
+conda env create -f benchmarks/environment.yml
 ```
 
 The build script activates the appropriate existing environment for each
@@ -125,6 +125,44 @@ Generated datasets and runs live under the ignored `data/` and benchmark
 output directories. MICRONS download/conversion helpers are in `scripts/`.
 Large `tdbase_large` nuclei and nuclei-nuclei datasets can be generated
 with `scripts/generate_large_nu_nn_data.sh`.
+
+### Download published benchmark inputs
+
+The raw inputs for the nuclei/vessel, cube/sphere, and MICRONS workloads are
+published on Hugging Face. Create the benchmark environment (which includes
+`huggingface_hub`) and inspect the pinned download manifest first:
+
+```bash
+conda env create -f benchmarks/overlap/environment.yml
+conda activate pierce_benchmarks
+python scripts/download_benchmark_datasets.py --dry-run
+```
+
+By default, downloads are cached in the ignored `.hf-cache/` directory in the
+checkout, so they stay on the same filesystem as the benchmark data. Use
+`--cache-dir /path/on/project/storage` for a one-off location, or set
+`PIERCE_HF_CACHE=/path/on/project/storage` once in a shell or cluster module
+to make that location the default for all downloader invocations.
+
+To validate a clean setup on a machine that already has generated data, move
+the existing `data/` tree and the legacy MICRONS source directory aside, then
+install every published input:
+
+```bash
+python scripts/download_benchmark_datasets.py --archive-existing
+python scripts/download_benchmark_datasets.py --verify
+```
+
+The backups are timestamped siblings named `data.hf-backup-<timestamp>` and
+`scripts/microns_data.hf-backup-<timestamp>`; they and temporary downloader
+files are ignored by Git. Restore one by first moving the newly created path
+out of the way, then rename its backup to the original name.
+
+The installer stores the files under `data/<scenario>/raw/`, including sphere
+mesh-complexity stages 1–5. Benchmark runs perform preprocessing on demand.
+For MICRONS, the downloaded aggregated OBJ pairs are consumed directly; the
+historical GLB-source workflow below remains available when those aggregate
+files are absent.
 
 To generate the neuron datasets used by the MICrONS benchmarks, use the same
 mesh-bounding-box workflow for both regional subsets:

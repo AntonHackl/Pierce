@@ -14,6 +14,7 @@ from benchmarks.common.scenario_utils import (
     PIERCE_DIR,
     canonical_microns_aggregated_paths,
     create_benchmark_run_layout,
+    microns_aggregates_are_available,
     ensure_microns_splits,
     ensure_microns_aggregated_meshes,
     get_shared_data_dirs,
@@ -94,10 +95,12 @@ def main():
     
     for dataset in args.datasets:
         print(f"\n--- Preparing MICrONS {dataset} dataset ---")
-        split_a, split_b = ensure_microns_splits(dataset, source_root, splits_dir)
-        
         agg_a, agg_b = canonical_microns_aggregated_paths(shared_dirs["raw"], dataset)
-        ensure_microns_aggregated_meshes(split_a, split_b, agg_a, agg_b)
+        if microns_aggregates_are_available(shared_dirs["raw"], dataset):
+            print(f"Using pre-aggregated MICrONS inputs: {agg_a.name}, {agg_b.name}")
+        else:
+            split_a, split_b = ensure_microns_splits(dataset, source_root, splits_dir)
+            ensure_microns_aggregated_meshes(split_a, split_b, agg_a, agg_b)
 
         case_label = f"microns_{dataset}"
         case_log_dir = logs_dir / sanitize_case_token(case_label)

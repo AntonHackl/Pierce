@@ -13,6 +13,11 @@ benchmark_snapshots/
 memories/
 data/
 microns_data/
+data.hf-backup-*/
+scripts/microns_data.hf-backup-*/
+data/.hf-download-*/
+scripts/microns_data/.hf-download-*/
+.hf-cache/
 benchmarks/data/
 benchmarks/slurm_logs/
 benchmarks/**/data/

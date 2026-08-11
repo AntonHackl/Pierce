@@ -379,6 +379,12 @@ def canonical_microns_aggregated_paths(raw_dir: Path, dataset: str) -> Tuple[Pat
     return raw_dir / f"microns_{dataset}_split_a_aggregated.obj", raw_dir / f"microns_{dataset}_split_b_aggregated.obj"
 
 
+def microns_aggregates_are_available(raw_dir: Path, dataset: str) -> bool:
+    """Return whether a pre-aggregated MICrONS pair is ready to benchmark."""
+    aggregate_a, aggregate_b = canonical_microns_aggregated_paths(raw_dir, dataset)
+    return aggregate_a.is_file() and aggregate_b.is_file()
+
+
 def ensure_microns_splits(
     dataset: str,
     source_root: Path,
