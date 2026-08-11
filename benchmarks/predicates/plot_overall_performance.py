@@ -81,15 +81,15 @@ OVERALL_PERFORMANCE_SPECS = [
     },
     {
         "run_prefix": "query_comparison_microns",
-        "row_matcher": lambda r: r.get("size_gb") == 4,
+        "row_matcher": lambda r: r.get("dataset") == "small",
         "group_name": r"Neurons$_1$ $\bowtie$ Neurons$_2$",
-        "selector": "size_gb=4",
+        "selector": "dataset=small",
     },
     {
         "run_prefix": "query_comparison_microns",
-        "row_matcher": lambda r: r.get("size_gb") == 8,
+        "row_matcher": lambda r: r.get("dataset") == "large",
         "group_name": r"Neurons$_3$ $\bowtie$ Neurons$_4$",
-        "selector": "size_gb=8",
+        "selector": "dataset=large",
     },
 ]
 

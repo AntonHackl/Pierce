@@ -365,20 +365,31 @@ def copy_to_latest_file(source_path: Path, latest_path: Path) -> None:
     shutil.copyfile(source_path, latest_path)
 
 
-def canonical_microns_aggregated_paths(raw_dir: Path, size_gb: int) -> Tuple[Path, Path]:
-    return raw_dir / f"microns_{size_gb}gb_split_a_aggregated.obj", raw_dir / f"microns_{size_gb}gb_split_b_aggregated.obj"
+MICRONS_DATASETS = ("small", "large")
+
+
+def _validate_microns_dataset(dataset: str) -> str:
+    if dataset not in MICRONS_DATASETS:
+        raise ValueError(f"Unknown MICrONS dataset {dataset!r}; expected one of {MICRONS_DATASETS}")
+    return dataset
+
+
+def canonical_microns_aggregated_paths(raw_dir: Path, dataset: str) -> Tuple[Path, Path]:
+    dataset = _validate_microns_dataset(dataset)
+    return raw_dir / f"microns_{dataset}_split_a_aggregated.obj", raw_dir / f"microns_{dataset}_split_b_aggregated.obj"
 
 
 def ensure_microns_splits(
-    size_gb: int,
+    dataset: str,
     source_root: Path,
     splits_dir: Path,
 ) -> Tuple[Path, Path]:
-    split_a = splits_dir / f"microns_{size_gb}gb_split_a.txt"
-    split_b = splits_dir / f"microns_{size_gb}gb_split_b.txt"
-    meta_path = splits_dir / f"microns_{size_gb}gb_meta.json"
+    dataset = _validate_microns_dataset(dataset)
+    split_a = splits_dir / f"microns_{dataset}_split_a.txt"
+    split_b = splits_dir / f"microns_{dataset}_split_b.txt"
+    meta_path = splits_dir / f"microns_{dataset}_meta.json"
 
-    source_dir = source_root / f"microns_region_{size_gb}gb_glb"
+    source_dir = source_root / f"microns_region_{dataset}_glb"
     
     if split_a.exists() and split_b.exists() and meta_path.exists():
         return split_a, split_b

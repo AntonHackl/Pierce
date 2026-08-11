@@ -138,41 +138,43 @@ scripts/construct_micron_datasets.sh
 This is equivalent to running these two commands from the repository root:
 
 ```bash
-# 4 GB neuron subset (used as Neurons_1 / Neurons_2)
+# Small neuron subset (used as Neurons_1 / Neurons_2)
 python scripts/download_microns_region_by_mesh_bbox.py \
+  --dataset-name small \
   --target-gb 4.0 --max-gb 4.3 \
   --x-min-nm 347992 --x-max-nm 1447384 \
   --y-min-nm 300952 --y-max-nm 1116304 \
   --z-min-nm 594000 --z-max-nm 1114320 \
   --format glb --separate --shuffle \
-  --download-dir ./scripts/microns_data/microns_region_4gb_npz \
-  --export-dir ./scripts/microns_data/microns_region_4gb_glb
+  --download-dir ./scripts/microns_data/microns_region_small_npz \
+  --export-dir ./scripts/microns_data/microns_region_small_glb
 
-# 8 GB neuron subset (used as Neurons_3 / Neurons_4)
+# Large neuron subset (used as Neurons_3 / Neurons_4)
 python scripts/download_microns_region_by_mesh_bbox.py \
+  --dataset-name large \
   --target-gb 8.0 --max-gb 9.0 \
   --x-min-nm 800688 --x-max-nm 994688 \
   --y-min-nm 611628 --y-max-nm 805628 \
   --z-min-nm 757160 --z-max-nm 951160 \
   --format glb --separate --shuffle \
-  --download-dir ./scripts/microns_data/microns_region_8gb_npz \
-  --export-dir ./scripts/microns_data/microns_region_8gb_glb
+  --download-dir ./scripts/microns_data/microns_region_large_npz \
+  --export-dir ./scripts/microns_data/microns_region_large_glb
 ```
 
 These commands produce the same source directory layout that the evaluation
 benchmarks expect:
 
-- `scripts/microns_data/microns_region_4gb_glb`
-- `scripts/microns_data/microns_region_8gb_glb`
+- `scripts/microns_data/microns_region_small_glb`
+- `scripts/microns_data/microns_region_large_glb`
 
 When running the MICrONS benchmarks in this repo, point them at that root:
 
 ```bash
 python benchmarks/overlap/run_microns_overlap.py \
   --source-root ./scripts/microns_data \
-  --sizes 4 8
+  --datasets small large
 
 python benchmarks/predicates/run_microns_query_comparison.py \
   --source-root ./scripts/microns_data \
-  --sizes 4 8
+  --datasets small large
 ```

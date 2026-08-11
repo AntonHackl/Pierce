@@ -21,6 +21,7 @@ from benchmarks.common.scenario_utils import (
     ensure_microns_splits,
     ensure_microns_aggregated_meshes,
     get_shared_data_dirs,
+    MICRONS_DATASETS,
     write_json,
 )
 from benchmarks.common.viz_utils import generate_scalability_figure, generate_breakdown_figure
@@ -33,8 +34,8 @@ CGAL_DIR = REPO_ROOT / "baselines/face"
 
 def main():
     parser = argparse.ArgumentParser(description="MICrONS subset benchmark for mesh overlap (Direct Estimation, Face, TOUCH)")
-    parser.add_argument("--sizes", type=int, nargs="+", default=[4, 8],
-                        help="MICrONS subset sizes in GB to benchmark")
+    parser.add_argument("--datasets", nargs="+", choices=MICRONS_DATASETS, default=list(MICRONS_DATASETS),
+                        help="Named MICrONS datasets to benchmark")
     parser.add_argument("--source-root", type=str, 
                         default=str(REPO_ROOT / "scripts" / "microns_data"),
                         help="Root directory containing MICrONS GLB subset folders")
@@ -71,11 +72,11 @@ def main():
         adapters["touch"] = TOUCHAdapter(str(CGAL_DIR), preprocessed_dir=str(dirs["preprocessed"]), threads=args.threads, grid_cell_size=args.grid_cell_size)
 
     results = []
-    for size_gb in args.sizes:
-        print(f"\n--- Preparing MICrONS {size_gb}GB dataset ---")
-        split_a, split_b = ensure_microns_splits(size_gb, source_root, splits_dir)
+    for dataset in args.datasets:
+        print(f"\n--- Preparing MICrONS {dataset} dataset ---")
+        split_a, split_b = ensure_microns_splits(dataset, source_root, splits_dir)
         
-        agg_a, agg_b = canonical_microns_aggregated_paths(dirs["raw"], size_gb)
+        agg_a, agg_b = canonical_microns_aggregated_paths(dirs["raw"], dataset)
         ensure_microns_aggregated_meshes(split_a, split_b, agg_a, agg_b)
 
         # Preprocessing (All approaches share the Pierce .pre files)
@@ -92,7 +93,7 @@ def main():
                      pre_adapter.preprocess_from_source(str(file_path), str(file_path), log_dir=str(run_log_dir))
 
         entry = {
-            "size_gb": size_gb,
+            "dataset": dataset,
             "size_bytes_a": agg_a.stat().st_size if agg_a.exists() else 0,
             "size_bytes_b": agg_b.stat().st_size if agg_b.exists() else 0,
         }
@@ -129,7 +130,7 @@ def main():
         entry["result_size"] = result_size
 
         results.append(entry)
-        print(f"size_gb={size_gb}: done")
+        print(f"dataset={dataset}: done")
 
     payload = {
         "metadata": {
@@ -138,7 +139,7 @@ def main():
             "timestamp": run_layout["timestamp"],
             "run_name": run_layout["run_name"],
             "run_dir": str(run_layout["run_dir"]),
-            "sizes": args.sizes,
+            "datasets": args.datasets,
             "grid_cell_size": args.grid_cell_size,
             "runs": args.runs,
             "warmup_runs": args.warmup_runs,
@@ -164,8 +165,8 @@ def main():
         figures_dir=figures_dir,
         timestamp=run_layout["timestamp"],
         scenario_name="microns_overlap",
-        x_axis_key="size_gb",
-        x_axis_label="MICrONS subset size (GB)",
+        x_axis_key="dataset",
+        x_axis_label="MICrONS dataset",
         y_axis_label="Overlap query time (ms) [log scale]",
         title="MICrONS Overlap Scalability"
     )
@@ -177,7 +178,7 @@ def main():
             figures_dir=figures_dir,
             timestamp=run_layout["timestamp"],
             scenario_name="microns_overlap",
-            x_axis_key="size_gb",
+            x_axis_key="dataset",
             x_axis_label="Dataset Size",
             y_axis_label="Query time (ms)",
             title="Overlap Runtime Breakdown"

@@ -192,7 +192,7 @@ def _extract_latest_tdbase_supported_nu_nn_large(path: Path) -> Optional[GroupRe
     )
 
 
-def _extract_microns_4gb(path: Path) -> Optional[GroupResult]:
+def _extract_microns_small(path: Path) -> Optional[GroupResult]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     md = payload.get("metadata", {})
     scenario = md.get("scenario")
@@ -203,11 +203,11 @@ def _extract_microns_4gb(path: Path) -> Optional[GroupResult]:
     if not isinstance(results, list):
         return None
 
-    row = next((r for r in results if r.get("size_gb") == 4), None)
+    row = next((r for r in results if r.get("dataset") == "small"), None)
     if row is None:
         return None
 
-    approaches = md.get("approaches") or [k for k in row.keys() if k not in {"size_gb", "size_bytes_a", "size_bytes_b"}]
+    approaches = md.get("approaches") or [k for k in row.keys() if k not in {"dataset", "size_bytes_a", "size_bytes_b"}]
     approach_to_mean: Dict[str, float] = {}
     for app in approaches:
         res = row.get(app)
@@ -239,7 +239,7 @@ def _extract_microns_4gb(path: Path) -> Optional[GroupResult]:
         group_name=r"Neurons$_1$ $\bowtie$ Neurons$_2$",
         run_dir=run_dir,
         run_timestamp=_parse_ts_from_run_dir(run_dir),
-        selector_value="size_gb=4",
+        selector_value="dataset=small",
         approach_to_mean=approach_to_mean,
         result_size=result_size,
     )
@@ -430,7 +430,7 @@ def main() -> None:
             "Create grouped bar chart for overlap overall performance using latest usable runs: "
             "large nu (highest TDBase-supported nu from the latest usable large_nu_v run), "
             "large nu nn (highest TDBase-supported nu from the latest usable large_nu_nn run), "
-            "MICrONS (4GB), cube scalability (largest dataset)."
+            "MICrONS small, cube scalability (largest dataset)."
         )
     )
     parser.add_argument(
@@ -446,7 +446,7 @@ def main() -> None:
     group_nu = _pick_latest_usable(runs_root, "overlap_nu_scalability", _extract_latest_tdbase_supported_nu_large)
     group_nu_nn = _pick_latest_usable(runs_root, "overlap_nu_scalability", _extract_latest_tdbase_supported_nu_nn_large)
     group_microns = _pick_latest_usable_with_required_approach(
-        runs_root, "overlap_microns", _extract_microns_4gb, "pierce"
+        runs_root, "overlap_microns", _extract_microns_small, "pierce"
     )
     group_cube = _pick_latest_usable(runs_root, "overlap_cube_scalability", _extract_cube_largest)
 

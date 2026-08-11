@@ -8,8 +8,9 @@ SCRIPT_DIR=$(dirname "$0")
 cd "$SCRIPT_DIR"
 
 echo "--------------------------------------------------"
-echo "Constructing 4GB Dataset..."
+echo "Constructing small dataset..."
 python ./download_microns_region_by_mesh_bbox.py \
+    --dataset-name small \
     --target-gb 4.0 --max-gb 4.3 \
     --x-min-nm 347992 --x-max-nm 1447384 \
     --y-min-nm 300952 --y-max-nm 1116304 \
@@ -17,8 +18,9 @@ python ./download_microns_region_by_mesh_bbox.py \
     --shuffle
 
 echo "--------------------------------------------------"
-echo "Constructing 8GB Dataset (194um cube)..."
+echo "Constructing large dataset (194um cube)..."
 python ./download_microns_region_by_mesh_bbox.py \
+    --dataset-name large \
     --target-gb 8.0 --max-gb 9.0 \
     --x-min-nm 800688 --x-max-nm 994688 \
     --y-min-nm 611628 --y-max-nm 805628 \
@@ -28,5 +30,5 @@ python ./download_microns_region_by_mesh_bbox.py \
 echo "--------------------------------------------------"
 echo "All requested datasets have been processed."
 echo "Output directories:"
-echo "  - ./microns_data/microns_region_4gb_glb"
-echo "  - ./microns_data/microns_region_8gb_glb"
+echo "  - ./microns_data/microns_region_small_glb"
+echo "  - ./microns_data/microns_region_large_glb"

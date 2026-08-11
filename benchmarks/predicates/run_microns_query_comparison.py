@@ -17,6 +17,7 @@ from benchmarks.common.scenario_utils import (
     ensure_microns_splits,
     ensure_microns_aggregated_meshes,
     get_shared_data_dirs,
+    MICRONS_DATASETS,
     write_json,
 )
 from benchmarks.predicates.core import (
@@ -32,12 +33,12 @@ from benchmarks.predicates.core import (
 
 REPO_ROOT = SCRIPT_DIR.parent.parent
 PIERCE_DIR = REPO_ROOT / "pierce"
-DEFAULT_MICRONS_SIZES = [4, 8]
+DEFAULT_MICRONS_DATASETS = list(MICRONS_DATASETS)
 
 def main():
     parser = argparse.ArgumentParser(description="MICrONS subset benchmark for mesh query comparison")
-    parser.add_argument("--sizes", type=int, nargs="+", default=DEFAULT_MICRONS_SIZES,
-                        help="MICrONS subset sizes in GB to benchmark")
+    parser.add_argument("--datasets", nargs="+", choices=MICRONS_DATASETS, default=DEFAULT_MICRONS_DATASETS,
+                        help="Named MICrONS datasets to benchmark")
     parser.add_argument("--source-root", type=str, 
                         default=str(REPO_ROOT / "scripts" / "microns_data"),
                         help="Root directory containing MICrONS GLB subset folders")
@@ -91,14 +92,14 @@ def main():
     results = []
     case_labels = []
     
-    for size_gb in args.sizes:
-        print(f"\n--- Preparing MICrONS {size_gb}GB dataset ---")
-        split_a, split_b = ensure_microns_splits(size_gb, source_root, splits_dir)
+    for dataset in args.datasets:
+        print(f"\n--- Preparing MICrONS {dataset} dataset ---")
+        split_a, split_b = ensure_microns_splits(dataset, source_root, splits_dir)
         
-        agg_a, agg_b = canonical_microns_aggregated_paths(shared_dirs["raw"], size_gb)
+        agg_a, agg_b = canonical_microns_aggregated_paths(shared_dirs["raw"], dataset)
         ensure_microns_aggregated_meshes(split_a, split_b, agg_a, agg_b)
 
-        case_label = f"microns_{size_gb}gb"
+        case_label = f"microns_{dataset}"
         case_log_dir = logs_dir / sanitize_case_token(case_label)
         case_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -106,7 +107,7 @@ def main():
         ensure_preprocessed(adapters, [agg_a, agg_b], log_dir=case_log_dir)
 
         row = {
-            "size_gb": size_gb,
+            "dataset": dataset,
             "mesh1": str(agg_a),
             "mesh2": str(agg_b),
             "size_bytes1": agg_a.stat().st_size if agg_a.exists() else 0,
@@ -128,7 +129,7 @@ def main():
 
         results.append(row)
         case_labels.append(case_label)
-        print(f"size_gb={size_gb}: done")
+        print(f"dataset={dataset}: done")
 
     generate_query_comparison_figures(
         results_rows=results,
@@ -146,7 +147,7 @@ def main():
             "timestamp": run_layout["timestamp"],
             "run_name": run_layout["run_name"],
             "run_dir": str(run_layout["run_dir"]),
-            "sizes": args.sizes,
+            "datasets": args.datasets,
             "grid_cell_size": args.grid_cell_size,
             "runs": args.runs,
             "warmup_runs": args.warmup_runs,

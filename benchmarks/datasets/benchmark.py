@@ -30,6 +30,7 @@ from benchmarks.common.scenario_utils import (
     ensure_cube_pair_dataset,
     ensure_sphere_pair_dataset,
     get_shared_data_dirs,
+    MICRONS_DATASETS,
     write_json,
 )
 from benchmarks.common.adapters.tdbase_common import (
@@ -575,7 +576,7 @@ def _build_latex_table(rows: List[Dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _resolve_microns_pair_paths(size_gb: int) -> Tuple[Path, Path]:
+def _resolve_microns_pair_paths(dataset: str) -> Tuple[Path, Path]:
     scenario_candidates = [
         "microns_overlap",
         "microns_query_comparison",
@@ -584,11 +585,11 @@ def _resolve_microns_pair_paths(size_gb: int) -> Tuple[Path, Path]:
     tried: List[Tuple[str, Path, Path]] = []
     for scenario in scenario_candidates:
         dirs = get_shared_data_dirs(scenario)
-        a_path, b_path = canonical_microns_aggregated_paths(dirs["raw"], size_gb)
+        a_path, b_path = canonical_microns_aggregated_paths(dirs["raw"], dataset)
         tried.append((scenario, a_path, b_path))
         if a_path.exists() and b_path.exists():
             _log(
-                f"resolved MICrONS {size_gb}GB from scenario={scenario}: "
+                f"resolved MICrONS {dataset} from scenario={scenario}: "
                 f"{a_path.name}, {b_path.name}"
             )
             return a_path, b_path
@@ -598,7 +599,7 @@ def _resolve_microns_pair_paths(size_gb: int) -> Tuple[Path, Path]:
         for scenario, a_path, b_path in tried
     )
     raise FileNotFoundError(
-        f"MICrONS {size_gb}GB split files not found in any known shared-data scenario. Tried: {tried_str}"
+        f"MICrONS {dataset} split files not found in any known shared-data scenario. Tried: {tried_str}"
     )
 
 
@@ -616,8 +617,8 @@ def main() -> None:
         default=DEFAULT_TISSUE_NU_NN,
         help="NU count used for the current large nuclei-nuclei overall-performance point",
     )
-    parser.add_argument("--microns-size-gb", type=int, default=4, help="MICrONS size used in overall benchmark point")
-    parser.add_argument("--large-microns-size-gb", type=int, default=8, help="MICrONS large size used for Neurons 3 and 4")
+    parser.add_argument("--microns-dataset", choices=MICRONS_DATASETS, default="small", help="MICrONS dataset used for Neurons 1 and 2")
+    parser.add_argument("--large-microns-dataset", choices=MICRONS_DATASETS, default="large", help="MICrONS dataset used for Neurons 3 and 4")
     parser.add_argument("--cube-count-b", type=int, default=1000000, help="Cubes count for dataset B used in overall benchmark point")
     parser.add_argument(
         "--tdbase-large-scenario",
@@ -663,7 +664,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     _log(
-        f"dataset benchmark start nu_v={args.nu_v} nu_nn={args.nu_nn} microns_size_gb={args.microns_size_gb} "
+        f"dataset benchmark start nu_v={args.nu_v} nu_nn={args.nu_nn} microns_dataset={args.microns_dataset} "
         f"cube_count_b={args.cube_count_b} tdbase_large_scenario={args.tdbase_large_scenario} "
         f"tdbase_loading_scenario={args.tdbase_loading_scenario}"
     )
@@ -692,8 +693,8 @@ def main() -> None:
     loading_nuclei_400_1_path, loading_nuclei_400_2_path = canonical_nn_pair_paths(
         tdbase_loading_dirs["raw"], nu=args.nu_nn, nv=750, prefix="tdbase_large"
     )
-    neurons_1, neurons_2 = _resolve_microns_pair_paths(args.microns_size_gb)
-    neurons_3, neurons_4 = _resolve_microns_pair_paths(args.large_microns_size_gb)
+    neurons_1, neurons_2 = _resolve_microns_pair_paths(args.microns_dataset)
+    neurons_3, neurons_4 = _resolve_microns_pair_paths(args.large_microns_dataset)
     cubes_1, cubes_2 = canonical_cube_pair_paths(
         cube_dirs["raw"],
         num_cubes_a=200000,
@@ -1080,7 +1081,8 @@ def main() -> None:
             "run_dir": str(run_layout["run_dir"]),
             "nu_v": args.nu_v,
             "nu_nn": args.nu_nn,
-            "microns_size_gb": args.microns_size_gb,
+            "microns_dataset": args.microns_dataset,
+            "large_microns_dataset": args.large_microns_dataset,
             "cube_count_b": args.cube_count_b,
             "tdbase_timing_mode": args.tdbase_timing_mode,
             "tdbase_large_scenario": args.tdbase_large_scenario,

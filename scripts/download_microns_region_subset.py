@@ -13,8 +13,8 @@ Example:
     --z-min-nm 594000 --z-max-nm 1114320 \
     --target-gb 4.0 --max-gb 4.3 \
     --format glb --separate \
-    --download-dir ./tmp/microns_region_4gb_npz \
-    --export-dir ./tmp/microns_region_4gb_glb
+    --download-dir ./tmp/microns_region_small_npz \
+    --export-dir ./tmp/microns_region_small_glb
 """
 
 from __future__ import annotations
@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     
     script_dir = Path(__file__).parent
+    parser.add_argument(
+        "--dataset-name",
+        choices=("small", "large"),
+        help="Stable name used for the default output directories.",
+    )
     parser.add_argument("--download-dir", help="Directory to store downloaded .npz files.")
     parser.add_argument("--export-dir", help="Directory to store converted meshes.")
     parser.add_argument("--format", choices=["glb", "obj"], default="glb")
@@ -82,9 +87,13 @@ def parse_args() -> argparse.Namespace:
     
     # Set dynamic defaults if not provided
     if args.download_dir is None:
-        args.download_dir = str(script_dir / "microns_data" / f"microns_region_{int(args.target_gb)}gb_npz")
+        if args.dataset_name is None:
+            parser.error("--dataset-name is required when --download-dir is omitted")
+        args.download_dir = str(script_dir / "microns_data" / f"microns_region_{args.dataset_name}_npz")
     if args.export_dir is None:
-        args.export_dir = str(script_dir / "microns_data" / f"microns_region_{int(args.target_gb)}gb_glb")
+        if args.dataset_name is None:
+            parser.error("--dataset-name is required when --export-dir is omitted")
+        args.export_dir = str(script_dir / "microns_data" / f"microns_region_{args.dataset_name}_glb")
         
     return args
 
