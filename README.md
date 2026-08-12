@@ -4,6 +4,21 @@ Pierce is the artifact for *Pierce: GPU Ray Tracing for Spatial Joins over
 Complex 3D Data*. It contains the implementation and the benchmark workflows
 used for the paper, without unrelated historical evaluation code.
 
+## License and third-party code
+
+Pierce is licensed under the GNU General Public License, version 3
+(`GPL-3.0-only`); see [LICENSE](LICENSE).  This is required because the
+repository includes and modifies GPL-3.0 TDBase code.  In particular,
+`pierce/preprocess/src/tdbase_lib/` is a modified, copied subset of TDBase
+that is compiled into the DT preprocessing executable, and
+`baselines/tdbase_extensions/` builds modified TDBase sources.
+
+The included TDBase snapshot is from
+[`tengdj/tdbase`](https://github.com/tengdj/tdbase) at commit
+`5058e2f540438a497cd0592b9044e0bcbd745cbb`.  Its original license remains at
+`baselines/tdbase/LICENSE`.  See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+for additional preserved notices and attribution.
+
 ## Layout
 
 - `pierce/`: preprocessing and OptiX/CUDA query implementation.
