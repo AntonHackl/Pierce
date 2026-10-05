@@ -19,6 +19,9 @@
 #include <sys/types.h>
 #include <mutex>
 #include <filesystem>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 #if defined(_WIN32) || defined(_WIN64)
 #ifndef NOMINMAX
@@ -244,19 +247,23 @@ inline void list_files(const char *path, std::vector<std::string> &f_list){
 }
 
 
-inline long file_size(const char *file){
+inline std::int64_t file_size(const char *file){
     std::error_code ec;
-    if (fs::exists(file, ec) && fs::is_regular_file(file, ec)) {
-        return static_cast<long>(fs::file_size(file, ec));
+    const auto size = fs::file_size(file, ec);
+    if (!ec && size <= static_cast<std::uintmax_t>(std::numeric_limits<std::int64_t>::max())) {
+        return static_cast<std::int64_t>(size);
     }
     return -1;
 }
 
-inline long file_size(std::vector<std::string> &f_list){
-long size = 0;
+inline std::int64_t file_size(std::vector<std::string> &f_list){
+std::int64_t size = 0;
 for(std::string s:f_list){
-long ls = file_size(s.c_str());
+std::int64_t ls = file_size(s.c_str());
 if(ls>0){
+if (ls > std::numeric_limits<std::int64_t>::max() - size) {
+    throw std::overflow_error("Total file size exceeds int64 range");
+}
 size += ls;
 }
 }

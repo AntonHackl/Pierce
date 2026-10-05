@@ -4,7 +4,8 @@ from typing import Dict, Any, Optional
 import subprocess
 import sys
 import time
-import selectors
+import queue
+import threading
 from pathlib import Path
 from typing import List, Tuple
 
@@ -15,6 +16,7 @@ def run_command_streaming(
     timeout: Optional[float] = None,
     log_path: Optional[str] = None,
     prefix: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Run a command while streaming output to terminal and optionally logging to file.
 
@@ -27,56 +29,75 @@ def run_command_streaming(
         log_fh.write("COMMAND:\n")
         log_fh.write(" ".join(cmd) + "\n\n")
 
-    start = time.time()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            cwd=cwd,
+        )
+    except Exception:
+        if log_fh is not None:
+            log_fh.close()
+        raise
 
     stdout_parts: List[str] = []
     stderr_parts: List[str] = []
 
-    sel = selectors.DefaultSelector()
     assert proc.stdout is not None
     assert proc.stderr is not None
-    sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
-    sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+    # Windows selectors cannot monitor subprocess pipes. Separate readers also
+    # ensure that a full stderr pipe cannot block a child writing to stdout.
+    events = queue.Queue()
+
+    def read_stream(stream, name):
+        try:
+            for line in stream:
+                events.put((name, line))
+        except Exception as error:
+            events.put((name, error))
+        finally:
+            events.put((name, None))
+
+    readers = [
+        threading.Thread(target=read_stream, args=(proc.stdout, "stdout"), daemon=True),
+        threading.Thread(target=read_stream, args=(proc.stderr, "stderr"), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
 
     try:
-        while sel.get_map():
-            if timeout is not None and (time.time() - start) > timeout:
-                proc.kill()
+        open_streams = 2
+        while open_streams:
+            if timeout is not None and (time.monotonic() - start) > timeout:
                 raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+            try:
+                stream_name, line = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                open_streams -= 1
+                continue
+            if isinstance(line, Exception):
+                raise line
+            out_line = f"{prefix} {line}" if prefix else line
+            if stream_name == "stdout":
+                stdout_parts.append(line)
+                sys.stdout.write(out_line)
+                sys.stdout.flush()
+            else:
+                stderr_parts.append(line)
+                sys.stderr.write(out_line)
+                sys.stderr.flush()
+            if log_fh is not None:
+                log_fh.write(out_line)
+                log_fh.flush()
 
-            for key, _ in sel.select(timeout=0.1):
-                stream_name = key.data
-                line = key.fileobj.readline()
-                if line == "":
-                    try:
-                        sel.unregister(key.fileobj)
-                    except Exception:
-                        pass
-                    continue
-
-                if stream_name == "stdout":
-                    out_line = f"{prefix} {line}" if prefix else line
-                    stdout_parts.append(line)
-                    sys.stdout.write(out_line)
-                    sys.stdout.flush()
-                else:
-                    out_line = f"{prefix} {line}" if prefix else line
-                    stderr_parts.append(line)
-                    sys.stderr.write(out_line)
-                    sys.stderr.flush()
-
-                if log_fh is not None:
-                    log_fh.write(out_line)
-                    log_fh.flush()
-
-        return_code = proc.wait()
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - start))
+        return_code = proc.wait(timeout=remaining)
         stdout_text = "".join(stdout_parts)
         stderr_text = "".join(stderr_parts)
 
@@ -84,10 +105,13 @@ def run_command_streaming(
             raise subprocess.CalledProcessError(return_code, cmd, output=stdout_text, stderr=stderr_text)
         return stdout_text, stderr_text
     finally:
-        try:
-            sel.close()
-        except Exception:
-            pass
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for reader in readers:
+            reader.join(timeout=1.0)
+        proc.stdout.close()
+        proc.stderr.close()
         if log_fh is not None:
             log_fh.flush()
             log_fh.close()

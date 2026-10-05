@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.common.scenario_utils import create_benchmark_run_layout, write_json
+from benchmarks.common.executables import pierce_executable
 from benchmarks.common.scenario_utils import (
     build_selectivity_sweep,
     canonical_cube_pair_paths,
@@ -203,18 +204,18 @@ def main():
                 adapter.mode = mode
                 # Update executable manually as correct binary depends on mode
                 if mode == "exact":
-                    adapter.executable = adapter.pierce_dir / "query/build/bin/pierce_overlap_two_pass"
+                    adapter.executable = pierce_executable(adapter.pierce_dir, "query", "pierce_overlap_two_pass")
                     adapter.name = "exact" # For result key consistency in json
                 elif mode == "estimated":
                     adapter.mode = "direct_estimation"
-                    adapter.executable = adapter.pierce_dir / "query/build/bin/pierce_overlap"
+                    adapter.executable = pierce_executable(adapter.pierce_dir, "query", "pierce_overlap")
                     adapter.name = "estimated"
                 elif mode == "direct_estimation":
-                    adapter.executable = adapter.pierce_dir / "query/build/bin/pierce_overlap"
+                    adapter.executable = pierce_executable(adapter.pierce_dir, "query", "pierce_overlap")
                     adapter.name = "direct_estimation"
                 elif mode == "estimated_mem10":
                     adapter.mode = "direct_estimation"
-                    adapter.executable = adapter.pierce_dir / "query/build/bin/pierce_overlap"
+                    adapter.executable = pierce_executable(adapter.pierce_dir, "query", "pierce_overlap")
                     adapter.name = "estimated_mem10"
                     hash_table_slots = ESTIMATED_MEM10_FIXED_BYTES // 8  # unsigned long long slots
                     if hash_table_slots < 1024:

@@ -6,6 +6,7 @@ import numpy as np
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 from .base import OverlapBenchmarkAdapter, run_command_streaming
+from benchmarks.common.executables import pierce_executable
 
 class PierceAdapter(OverlapBenchmarkAdapter):
     def __init__(
@@ -46,18 +47,17 @@ class PierceAdapter(OverlapBenchmarkAdapter):
         
         # Determine executable based on mode
         # Binaries are in query/build/bin
-        query_bin_dir = self.pierce_dir / "query" / "build" / "bin"
         if self.mode == "exact":
-            self.executable = query_bin_dir / "pierce_overlap_two_pass"
+            self.executable = pierce_executable(self.pierce_dir, "query", "pierce_overlap_two_pass")
         elif self.mode == "direct_estimation":
-            self.executable = query_bin_dir / "pierce_overlap"
+            self.executable = pierce_executable(self.pierce_dir, "query", "pierce_overlap")
         elif self.mode == "estimated":
-            self.executable = query_bin_dir / "pierce_intersection"
+            self.executable = pierce_executable(self.pierce_dir, "query", "pierce_intersection")
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
         # Preprocess binary is in preprocess/build/bin
-        self.preprocess_exec = self.pierce_dir / "preprocess" / "build" / "bin" / "pierce_preprocess"
+        self.preprocess_exec = pierce_executable(self.pierce_dir, "preprocess", "pierce_preprocess")
         
     def _get_preprocessed_path(self, file_path: str) -> Path:
         input_path = Path(file_path)

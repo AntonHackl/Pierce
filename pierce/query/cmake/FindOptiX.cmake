@@ -30,6 +30,10 @@
 
 # Our initial guess will be within the SDK.
 
+if(NOT DEFINED OptiX_INSTALL_DIR AND DEFINED ENV{OptiX_INSTALL_DIR})
+  set(OptiX_INSTALL_DIR "$ENV{OptiX_INSTALL_DIR}" CACHE PATH "Path to OptiX installed location.")
+endif()
+
 if (WIN32)
   # If the user passed -DOptiX_INSTALL_DIR to CMake (or the build script set
   # the environment variable), prefer that. Otherwise search common install
@@ -130,7 +134,12 @@ endfunction()
 #  OptiX_report_error("optix library not found.  Please locate before proceeding." TRUE)
 #endif()
 if(NOT OptiX_INCLUDE)
-  OptiX_report_error("OptiX headers (optix.h and friends) not found.  Please locate before proceeding." TRUE)
+  message(FATAL_ERROR "OptiX headers not found. Set OptiX_INSTALL_DIR to the SDK directory.")
+endif()
+file(STRINGS "${OptiX_INCLUDE}/optix.h" optix_version_line REGEX "^#define OPTIX_VERSION [0-9]+")
+string(REGEX MATCH "[0-9]+$" optix_version "${optix_version_line}")
+if(NOT optix_version OR optix_version LESS 70700)
+  message(FATAL_ERROR "Pierce requires OptiX SDK 7.7 or newer (optixModuleCreate API).")
 endif()
 #if(NOT optix_prime_LIBRARY)
 #  OptiX_report_error("optix Prime library not found.  Please locate before proceeding." FALSE)

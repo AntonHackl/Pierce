@@ -45,7 +45,7 @@ TDBase must resolve to `5058e2f540438a497cd0592b9044e0bcbd745cbb`.
 
 - Ubuntu `24.04.4 LTS` was used for the artifact builds.
 - Conda `26.1.1` was used to create the environments.
-- NVIDIA OptiX SDK `7.5` or newer is required.
+- NVIDIA OptiX SDK `7.7` or newer is required (`9.0` tested on Windows).
 - CUDA `12.8` is installed through the Conda environment files
   (`cuda-toolkit=12.8`).
 - Export the OptiX SDK path before building:
@@ -55,6 +55,61 @@ export OptiX_INSTALL_DIR=/path/to/NVIDIA-OptiX-SDK-...
 ```
 
 ## Quick Setup
+
+### Native Windows (Pierce only)
+
+Install Visual Studio 2022 with **Desktop development with C++** (including
+the Windows SDK), Conda, and the NVIDIA OptiX SDK. An NVIDIA GPU and a driver
+compatible with CUDA 12.8 and the selected OptiX SDK are required.
+
+From PowerShell in the repository root:
+
+```powershell
+conda env create -f pierce/environment-windows.yml
+$env:OptiX_INSTALL_DIR = 'C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.0.0'
+.\build_windows.ps1
+conda activate pierce_windows_build
+python pierce/scripts/smoke_test.py
+```
+
+The build script initializes the x64 MSVC developer environment and uses
+Ninja/Release. It builds only Pierce preprocessing and its four queries.
+Use `-Only preprocess` or `-Only query` to select one component,
+`-Environment <name-or-prefix>` to use another existing Conda environment,
+and `-CondaExe <path>` if Conda is not found. `-Fresh` resets CMake's
+configuration when switching compilers or environments. OptiX can also be
+selected with `-OptixInstallDir <path>`; otherwise the script searches the
+standard SDK installation directory.
+
+Executables are under `pierce/preprocess/build/bin/*.exe` and
+`pierce/query/build/bin/*.exe`. Keep the query PTX files in their generated
+location and activate the Conda environment when running executables so
+the required DLLs are on `PATH`. To use Visual Studio's multi-configuration
+generator manually, the Python adapters also recognize `bin/Release`,
+`bin/RelWithDebInfo`, and `bin/Debug`.
+
+The pinned Windows stack was built and run with MSVC `19.44.35215`,
+CUDA `12.8.93` (toolkit package `12.8.2`), CMake `3.31.8`, CGAL C++ `6.2.1`,
+Boost `1.90.0`, Eigen `5.0.1`, tinyobjloader `2.0.0rc13`, and OptiX `9.0.0`
+on an RTX 5070 Laptop GPU. The component-specific `environment-windows.yml`
+files use the same core versions; the combined environment additionally
+supports the smoke test's Python adapters.
+
+The smoke test checks known overlap, intersection, and containment pairs,
+disjoint inputs, OBJ/RAW DT preprocessing, executable discovery, and Python
+subprocess streaming. Logs and generated datasets are kept under
+`tmp/windows-smoke/`. To exercise a RAW DT input larger than 2 GiB, run:
+
+```powershell
+python pierce/scripts/smoke_test.py --large-dt
+```
+
+On Windows this creates a sparse file, but preprocessing still reads about
+2 GiB into RAM. These checks cover small synthetic geometries and do not
+constitute a full paper benchmark run. The baseline build/test scripts are
+separate from this Windows workflow.
+
+### Linux artifact setup
 
 - Clone the repository and initialize submodules:
 

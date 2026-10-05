@@ -5,13 +5,13 @@ channels:
 dependencies:
   # Core
   - python=3.11
-  - cmake>=3.18
+  - cmake=3.31.8
   - ninja
   
   # CUDA
-  - cuda-toolkit=12.8
+  - cuda-toolkit=12.8.2
   
   # C++ Libraries
-  - cgal
-  - boost-cpp
-  - eigen
+  - cgal-cpp=6.2.1
+  - libboost-devel=1.90.0
+  - eigen=5.0.1

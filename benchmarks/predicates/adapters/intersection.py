@@ -6,6 +6,7 @@ import numpy as np
 from typing import Dict, Any, Optional
 from pathlib import Path
 from benchmarks.common.adapters.base import IntersectionBenchmarkAdapter, run_command_streaming
+from benchmarks.common.executables import pierce_executable
 
 
 class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
@@ -30,13 +31,12 @@ class PierceIntersectionAdapter(IntersectionBenchmarkAdapter):
         self.timings_dir.mkdir(parents=True, exist_ok=True)
         self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
 
-        query_bin_dir = self.pierce_dir / "query" / "build" / "bin"
         if self.mode in ("estimated", "estimate_only"):
-            self.executable = query_bin_dir / "pierce_intersection"
+            self.executable = pierce_executable(self.pierce_dir, "query", "pierce_intersection")
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-        self.preprocess_exec = self.pierce_dir / "preprocess" / "build" / "bin" / "pierce_preprocess"
+        self.preprocess_exec = pierce_executable(self.pierce_dir, "preprocess", "pierce_preprocess")
 
     def _get_preprocessed_path(self, file_path: str) -> Path:
         input_path = Path(file_path)

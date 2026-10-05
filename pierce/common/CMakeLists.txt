@@ -21,12 +21,10 @@ target_include_directories(pierce_common PUBLIC
 )
 
 # Find CGAL (for triangulation)
-set(Boost_NO_BOOST_CMAKE ON)
+include(cmake/PierceBoost.cmake)
 find_package(CGAL REQUIRED)
-find_package(Boost REQUIRED COMPONENTS filesystem system)
 
 target_link_libraries(pierce_common PUBLIC
     CGAL::CGAL
-    Boost::filesystem
-    Boost::system
+    ${PIERCE_BOOST_LIBRARIES}
 )

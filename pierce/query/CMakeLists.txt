@@ -11,11 +11,36 @@ if(UNIX AND NOT APPLE AND NOT WIN32)
     endif()
 endif()
 
+# CUDA must be selected before project() enables the CUDA language.
+if(DEFINED ENV{CONDA_PREFIX})
+    list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
+    if(WIN32)
+        list(PREPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/Library")
+        set(PIERCE_CUDA_ROOT "$ENV{CONDA_PREFIX}/Library")
+    else()
+        set(PIERCE_CUDA_ROOT "$ENV{CONDA_PREFIX}")
+    endif()
+    if(NOT DEFINED CMAKE_CUDA_COMPILER)
+        find_program(PIERCE_NVCC NAMES nvcc.exe nvcc
+            PATHS "${PIERCE_CUDA_ROOT}/bin" NO_DEFAULT_PATH)
+        if(PIERCE_NVCC)
+            set(CMAKE_CUDA_COMPILER "${PIERCE_NVCC}" CACHE FILEPATH "CUDA compiler")
+        endif()
+    endif()
+    if(PIERCE_NVCC AND NOT DEFINED CUDAToolkit_ROOT)
+        set(CUDAToolkit_ROOT "${PIERCE_CUDA_ROOT}" CACHE PATH "CUDA toolkit root")
+    endif()
+endif()
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    # Include compute_75 PTX so CUDA kernels can JIT on newer GPU generations.
+    set(CMAKE_CUDA_ARCHITECTURES 75 CACHE STRING "CUDA kernel architectures")
+endif()
+
 project(PierceQuery LANGUAGES CXX CUDA)
 
 # Policy settings
 cmake_policy(SET CMP0091 NEW)
-cmake_policy(SET CMP0167 NEW)
 
 # -----------------------------------------------------------------------
 # Global Settings
@@ -27,6 +52,8 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(NOT WIN32)
@@ -46,41 +73,9 @@ endif()
 # Dependencies
 # -----------------------------------------------------------------------
 
-# Detect conda environment
-if(DEFINED ENV{CONDA_PREFIX})
-    set(CONDA_PREFIX $ENV{CONDA_PREFIX})
-    message(STATUS "Conda environment detected: ${CONDA_PREFIX}")
-    list(PREPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}")
-    
-    if(WIN32)
-        set(CONDA_CUDA_BIN "${CONDA_PREFIX}/Library/bin")
-        set(CONDA_CUDA_INCLUDE "${CONDA_PREFIX}/Library/include")
-        set(CONDA_CUDA_LIB "${CONDA_PREFIX}/Library/lib")
-    else()
-        set(CONDA_CUDA_BIN "${CONDA_PREFIX}/bin")
-        set(CONDA_CUDA_INCLUDE "${CONDA_PREFIX}/include")
-        set(CONDA_CUDA_LIB "${CONDA_PREFIX}/lib")
-        include_directories(SYSTEM "${CONDA_PREFIX}/include")
-        link_directories("${CONDA_PREFIX}/lib")
-    endif()
-    
-    if(EXISTS "${CONDA_CUDA_BIN}/nvcc${CMAKE_EXECUTABLE_SUFFIX}" OR EXISTS "${CONDA_CUDA_BIN}/nvcc")
-        if(NOT DEFINED CUDA_PATH)
-            set(CUDA_PATH "${CONDA_PREFIX}" CACHE PATH "CUDA installation path")
-        endif()
-        if(NOT DEFINED CMAKE_CUDA_COMPILER)
-            file(GLOB NVCC_EXEC "${CONDA_CUDA_BIN}/nvcc*")
-            list(GET NVCC_EXEC 0 NVCC_PATH)
-            set(CMAKE_CUDA_COMPILER "${NVCC_PATH}" CACHE FILEPATH "CUDA compiler")
-        endif()
-        include_directories("${CONDA_CUDA_INCLUDE}")
-        link_directories("${CONDA_CUDA_LIB}")
-    endif()
-endif()
-
-find_package(Boost REQUIRED COMPONENTS filesystem system)
+include(../common/cmake/PierceBoost.cmake)
 find_package(CGAL REQUIRED)
-find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 include(cmake/FindOptiX.cmake)
@@ -207,7 +202,7 @@ add_executable(pierce_containment
 
 foreach(TARGET_NAME pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     target_include_directories(${TARGET_NAME} PRIVATE 
-        ${CUDA_INCLUDE_DIRS} 
+        ${CUDAToolkit_INCLUDE_DIRS}
         ${OptiX_INCLUDE} 
         ${SRC_DIR}
         ${CUDA_DIR}
@@ -220,31 +215,27 @@ endforeach()
 
 target_link_libraries(pierce_overlap_two_pass PRIVATE 
     pierce_common
-    ${CUDA_LIBRARIES} 
+    CUDA::cudart
     CGAL::CGAL 
-    Boost::filesystem 
-    Boost::system)
+    ${PIERCE_BOOST_LIBRARIES})
 
 target_link_libraries(pierce_intersection PRIVATE 
     pierce_common
-    ${CUDA_LIBRARIES} 
+    CUDA::cudart
     CGAL::CGAL 
-    Boost::filesystem 
-    Boost::system)
+    ${PIERCE_BOOST_LIBRARIES})
 
 target_link_libraries(pierce_overlap PRIVATE 
     pierce_common
-    ${CUDA_LIBRARIES} 
+    CUDA::cudart
     CGAL::CGAL 
-    Boost::filesystem 
-    Boost::system)
+    ${PIERCE_BOOST_LIBRARIES})
 
 target_link_libraries(pierce_containment PRIVATE 
     pierce_common
-    ${CUDA_LIBRARIES} 
+    CUDA::cudart
     CGAL::CGAL 
-    Boost::filesystem 
-    Boost::system)
+    ${PIERCE_BOOST_LIBRARIES})
 
 target_compile_definitions(pierce_overlap_two_pass PRIVATE INCLUDE_OPTIX)
 target_compile_definitions(pierce_intersection PRIVATE INCLUDE_OPTIX)

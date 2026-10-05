@@ -40,6 +40,7 @@ from benchmarks.common.adapters.tdbase_common import (
 from benchmarks.overlap.adapters.pierce_adapter import PierceAdapter
 from benchmarks.overlap.adapters.tdbase_adapter import TDBaseAdapter
 from benchmarks.overlap.adapters.base import run_command_streaming
+from benchmarks.common.executables import pierce_executable
 
 TDBASE_DIR = REPO_ROOT / "baselines" / "tdbase_extensions"
 SLURM_LOGS_DIR = REPO_ROOT / ".slurm" / "logs"
@@ -112,7 +113,7 @@ def _run_preprocess(
     logs_dir: Path,
 ) -> Dict[str, float | int | str]:
     _log(f"[preprocess:{dataset.dataset_id}] START source={dataset.source_path} grid={dataset.grid_cell_size}")
-    preprocess_exec = PIERCE_DIR / "preprocess" / "build" / "bin" / "pierce_preprocess"
+    preprocess_exec = pierce_executable(PIERCE_DIR, "preprocess", "pierce_preprocess")
     if not preprocess_exec.exists():
         raise FileNotFoundError(f"Preprocess executable not found: {preprocess_exec}")
 

@@ -17,15 +17,27 @@ void Tile::load(){
 		exit(-1);
 	}
 	// load the raw data into the buffer
-	data_size = file_size(tile_path.c_str());
-	data_buffer = new char[data_size];
+	const auto input_size = file_size(tile_path.c_str());
+	if(input_size <= 0 || static_cast<std::uint64_t>(input_size) > std::numeric_limits<size_t>::max()){
+		throw std::runtime_error("Invalid or unsupported DT file size: " + tile_path);
+	}
+	data_size = static_cast<size_t>(input_size);
 	//process_lock();
 	FILE *dt_fs = fopen(tile_path.c_str(), "rb");
 	if(dt_fs == NULL){
-		log("failed to open file %s",tile_path.c_str());
+		throw std::runtime_error("Failed to open DT file: " + tile_path);
+	}
+	try {
+		data_buffer = new char[data_size];
+	} catch (...) {
+		fclose(dt_fs);
+		throw;
 	}
 	if(fread((void *)data_buffer, sizeof(char), data_size, dt_fs) != data_size){
-		assert("failed reading" && false);
+		fclose(dt_fs);
+		delete [] data_buffer;
+		data_buffer = nullptr;
+		throw std::runtime_error("Failed to read DT file: " + tile_path);
 	}
 	fclose(dt_fs);
 	//process_unlock();
@@ -35,6 +47,7 @@ void Tile::load(){
 	if(dtype_uc > (unsigned char)MULTIMESH){
 		log("Invalid tile file type byte: %u in %s", (unsigned)dtype_uc, tile_path.c_str());
 		delete [] data_buffer;
+		data_buffer = nullptr;
 		return;
 	}
 	Decoding_Type dtype = (Decoding_Type)dtype_uc;
@@ -49,7 +62,7 @@ void Tile::load(){
 	}
 
 	tree = build_octree(10);
-	logt("loaded %ld polyhedra in tile %s", start, objects.size(), tile_path.c_str());
+	logt("loaded %zu polyhedra in tile %s", start, objects.size(), tile_path.c_str());
 }
 
 void Tile::dump_compressed(const char *path){

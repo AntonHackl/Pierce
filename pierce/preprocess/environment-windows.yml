@@ -5,13 +5,14 @@ channels:
 dependencies:
   # Core
   - python=3.11
-  - cmake>=3.25
+  - cmake=3.31.8
   - ninja
   
   # CUDA
-  - cuda-toolkit=12.8
+  - cuda-toolkit=12.8.2
   
   # C++ Libraries
-  - cgal>=6.0
-  - tinyobjloader
-  - eigen
+  - cgal-cpp=6.2.1
+  - libboost-devel=1.90.0
+  - tinyobjloader=2.0.0rc13
+  - eigen=5.0.1

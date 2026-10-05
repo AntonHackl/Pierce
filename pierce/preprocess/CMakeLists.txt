@@ -7,12 +7,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find dependencies
-# Conda's Boost packages do not ship per-component BoostConfig files. Force
-# CMake's FindBoost module so it resolves headers and libraries from the
-# active environment instead of mixing them with a system BoostConfig.
-set(Boost_NO_BOOST_CMAKE ON)
+include(../common/cmake/PierceBoost.cmake)
 find_package(CGAL REQUIRED)
-find_package(Boost REQUIRED COMPONENTS filesystem system)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(CUDAToolkit REQUIRED)
 
@@ -94,8 +90,7 @@ target_link_libraries(pierce_preprocess PRIVATE
     pierce_common
     CGAL::CGAL
     tinyobjloader::tinyobjloader
-    Boost::filesystem
-    Boost::system
+    ${PIERCE_BOOST_LIBRARIES}
     OpenMP::OpenMP_CXX
     CUDA::cudart
 )

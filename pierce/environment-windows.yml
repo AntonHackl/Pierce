@@ -1,0 +1,16 @@
+# Combined environment for Pierce only; tested with MSVC 19.44 and OptiX 9.0.
+# Visual Studio C++ tools and the OptiX SDK must be installed separately.
+name: pierce_windows_build
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.11
+  - cmake=3.31.8
+  - ninja
+  - cuda-toolkit=12.8.2
+  - cgal-cpp=6.2.1
+  - libboost-devel=1.90.0
+  - tinyobjloader=2.0.0rc13
+  - eigen=5.0.1
+  - numpy

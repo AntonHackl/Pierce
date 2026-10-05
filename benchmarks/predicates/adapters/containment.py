@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from benchmarks.common.adapters.base import ContainmentBenchmarkAdapter, run_command_streaming
+from benchmarks.common.executables import pierce_executable
 
 
 class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
@@ -30,9 +31,8 @@ class PierceContainmentAdapter(ContainmentBenchmarkAdapter):
         self.preprocessed_dir.mkdir(parents=True, exist_ok=True)
         self.timings_dir.mkdir(parents=True, exist_ok=True)
 
-        query_bin_dir = self.pierce_dir / "query" / "build" / "bin"
-        self.executable = query_bin_dir / "pierce_containment"
-        self.preprocess_exec = self.pierce_dir / "preprocess" / "build" / "bin" / "pierce_preprocess"
+        self.executable = pierce_executable(self.pierce_dir, "query", "pierce_containment")
+        self.preprocess_exec = pierce_executable(self.pierce_dir, "preprocess", "pierce_preprocess")
 
     def _get_preprocessed_path(self, file_path: str) -> Path:
         input_path = Path(file_path)
