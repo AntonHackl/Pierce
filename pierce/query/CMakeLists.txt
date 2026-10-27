@@ -153,16 +153,25 @@ NVCUDA_COMPILE_MODULE(
 # Executables
 # -----------------------------------------------------------------------
 
-add_executable(pierce_overlap_two_pass 
-    ${MESH_OVERLAP_APP_SOURCE} 
-    ${RUNTIME_SOURCES}
-    ${TIMER_SOURCE}
-    ${OPTIX_SOURCES} 
-    ${GEOMETRY_SOURCES} 
-    ${RAYTRACING_SOURCES} 
-    ${RESULT_COMPACTION_SOURCE} 
-    ${MESH_QUERY_DEDUP_SOURCE} 
-    ${SCAN_UTILS_SOURCE})
+# Shared exact-overlap engine, also used by the original benchmark CLI.
+add_library(pierce_query_runtime STATIC
+    ${SRC_DIR}/runtime/OverlapQuery.cpp
+    ${SRC_DIR}/runtime/QueryRuntime.cpp
+    ${RUNTIME_SOURCES} ${TIMER_SOURCE} ${OPTIX_SOURCES} ${GEOMETRY_SOURCES}
+    ${RAYTRACING_DIR}/MeshOverlapEdgesLauncher.cpp
+    ${MESH_QUERY_DEDUP_SOURCE} ${SCAN_UTILS_SOURCE})
+add_executable(pierce_overlap_two_pass ${MESH_OVERLAP_APP_SOURCE})
+add_executable(pierce_worker ${SRC_DIR}/applications/pierce_worker_main.cpp)
+add_executable(pierce_runtime_verify ${SRC_DIR}/applications/pierce_runtime_verify.cpp)
+target_link_libraries(pierce_runtime_verify PRIVATE pierce_query_runtime)
+set_target_properties(pierce_runtime_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+target_link_libraries(pierce_overlap_two_pass PRIVATE pierce_query_runtime)
+target_link_libraries(pierce_worker PRIVATE pierce_query_runtime)
+set_target_properties(pierce_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+target_link_libraries(pierce_query_runtime PUBLIC pierce_common CUDA::cudart CGAL::CGAL ${PIERCE_BOOST_LIBRARIES})
+target_include_directories(pierce_query_runtime PUBLIC
+    ${CUDAToolkit_INCLUDE_DIRS} ${OptiX_INCLUDE} ${SRC_DIR}/runtime
+    ${GEOMETRY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 
 add_executable(pierce_intersection
     ${ESTIMATED_INTERSECTION_APP_SOURCE}
@@ -200,7 +209,7 @@ add_executable(pierce_containment
     ${SCAN_UTILS_SOURCE}
     ${ESTIMATED_INTERSECTION_SOURCE})
 
-foreach(TARGET_NAME pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
+foreach(TARGET_NAME pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     target_include_directories(${TARGET_NAME} PRIVATE 
         ${CUDAToolkit_INCLUDE_DIRS}
         ${OptiX_INCLUDE} 
@@ -277,6 +286,6 @@ add_custom_target(copy_ptx ALL
     DEPENDS ${PTX_FILES}
     COMMENT "Copying PTX files to runtime bin directory..."
 )
-foreach(TARGET_NAME pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
+foreach(TARGET_NAME pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     add_dependencies(${TARGET_NAME} copy_ptx)
 endforeach()

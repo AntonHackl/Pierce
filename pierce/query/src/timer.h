@@ -22,6 +22,7 @@ public:
     long long getPhaseDuration(const std::string& phaseName) const;
     
     long long getTotalDuration() const;
+    long long getMeasurementDuration(const std::string& name) const;
 
 private:
     struct Phase {

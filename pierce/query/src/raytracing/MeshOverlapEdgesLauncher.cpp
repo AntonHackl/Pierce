@@ -125,6 +125,7 @@ void MeshOverlapEdgesLauncher::createSBT() {
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(d_ms_), &msRecord, sizeof(MissRecord), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(d_hg_), &hgRecord, sizeof(HitRecord), cudaMemcpyHostToDevice));
     
+    allocatedBytes_ = sizeof(rgRecord) + sizeof(msRecord) + sizeof(hgRecord) + sizeof(MeshOverlapEdgesLaunchParams);
     sbt_ = {};
     sbt_.raygenRecord = d_rg_;
     sbt_.missRecordBase = d_ms_;
@@ -154,6 +155,7 @@ void MeshOverlapEdgesLauncher::launchInternal(const MeshOverlapEdgesLaunchParams
 }
 
 void MeshOverlapEdgesLauncher::freeInternal() {
+    allocatedBytes_ = 0;
     if (d_lp_) CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_lp_)));
     if (d_hg_) CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_hg_)));
     if (d_ms_) CUDA_CHECK(cudaFree(reinterpret_cast<void*>(d_ms_)));

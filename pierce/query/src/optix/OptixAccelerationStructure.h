@@ -15,6 +15,7 @@ public:
     OptixAccelerationStructure& operator=(const OptixAccelerationStructure&) = delete;
     
     OptixTraversableHandle getHandle() const { return gasHandle_; }
+    size_t allocatedBytes() const { return outputSize_ + tempSize_; }
     bool isValid() const { return gasHandle_ != 0; }
     
     // Build from geometry uploader (already uploaded to GPU)

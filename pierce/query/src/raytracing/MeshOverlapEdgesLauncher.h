@@ -50,6 +50,7 @@ public:
     
     void launchMesh2ToMesh1(const MeshOverlapEdgesLaunchParams& params, int numEdges);
     
+    size_t allocatedBytes() const { return allocatedBytes_; }
     bool isValid() const { return pipeline_ != nullptr; }
     
 private:
@@ -65,6 +66,7 @@ private:
     CUdeviceptr d_ms_;
     CUdeviceptr d_hg_;
     CUdeviceptr d_lp_;
+    size_t allocatedBytes_ = 0;
 
     void launchInternal(const MeshOverlapEdgesLaunchParams& params, int numEdges);
     

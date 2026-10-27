@@ -190,3 +190,10 @@ void PerformanceTimer::writeResultsToFile(const std::string& filename) const {
     file.close();
     std::cout << "Performance timing written to " << filename << std::endl;
 }
+
+long long PerformanceTimer::getMeasurementDuration(const std::string& name) const {
+    long long total = 0;
+    for (const auto& phase : manualMeasurements)
+        if (phase.name == name) total += phase.duration_us;
+    return total;
+}
