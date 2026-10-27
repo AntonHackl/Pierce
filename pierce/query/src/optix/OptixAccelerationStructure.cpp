@@ -1,5 +1,6 @@
 #include "OptixAccelerationStructure.h"
 #include "OptixHelpers.h"
+#include "../runtime/MemoryBudget.h"
 #include <iostream>
 
 OptixAccelerationStructure::OptixAccelerationStructure(OptixContext& context, GeometryUploader& geometry)
@@ -11,15 +12,15 @@ OptixAccelerationStructure::~OptixAccelerationStructure() {
     freeInternal();
 }
 
-void OptixAccelerationStructure::build() {
+void OptixAccelerationStructure::build(pierce::MemoryBudget* budget) {
     if (!geometry_.isUploaded()) {
         std::cerr << "Error: Geometry must be uploaded before building acceleration structure" << std::endl;
         return;
     }
-    buildInternal();
+    buildInternal(budget);
 }
 
-void OptixAccelerationStructure::buildInternal() {
+void OptixAccelerationStructure::buildInternal(pierce::MemoryBudget* budget) {
     if (gasHandle_ != 0) {
         // Already built, free old resources first
         freeInternal();
@@ -51,6 +52,8 @@ void OptixAccelerationStructure::buildInternal() {
     OptixAccelBufferSizes gasSizes;
     OPTIX_CHECK(optixAccelComputeMemoryUsage(context_.getContext(), &accelOptions, &buildInput, 1, &gasSizes));
     
+    if (budget) budget->check(pierce::checkedAdd(gasSizes.tempSizeInBytes, gasSizes.outputSizeInBytes), "bvh_build");
+
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_tempBuffer_), gasSizes.tempSizeInBytes));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gasOutput_), gasSizes.outputSizeInBytes));
     

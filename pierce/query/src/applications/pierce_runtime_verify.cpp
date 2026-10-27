@@ -46,16 +46,16 @@ int main(int argc, char** argv) {
         require(baseline == expected, "Baseline differs from analytical cube result");
         pierce::QueryRuntime runtime(detectPTXPath("mesh_overlap_edges.ptx"));
         bool rejected = false;
-        try { runtime.query("bad", "bad"); } catch (const std::exception&) { rejected = true; }
+        try { runtime.queryPair("bad"); } catch (const std::exception&) { rejected = true; }
         require(rejected, "Query before load accepted");
-        runtime.load(argv[1], argv[2]);
-        const auto a = runtime.handleA(), b = runtime.handleB();
+        runtime.loadPair("small", argv[1], argv[2]);
+        const auto a = runtime.pairs().begin()->second->handle, b = runtime.pairs().begin()->second->handle;
         const auto residentBytes = runtime.datasetBytes();
         require(residentBytes > 0, "Missing resident allocations");
         size_t afterSecond = 0;
         for (int i = 0; i < 100; ++i) {
-            require(pairs(runtime.query(a, b)) == baseline, "Resident results differ from baseline");
-            require(runtime.handleA() == a && runtime.handleB() == b, "Handles changed");
+            require(pairs(runtime.queryPair(a)) == baseline, "Resident results differ from baseline");
+            require(runtime.pairs().begin()->second->handle == a && runtime.pairs().begin()->second->handle == b, "Handles changed");
             require(runtime.datasetBytes() == residentBytes, "Resident allocations grew");
             if (i == 1) afterSecond = freeBytes();
         }
@@ -64,32 +64,32 @@ int main(int argc, char** argv) {
         const auto afterHundred = freeBytes();
         // Driver caches and other desktop GPU clients may move global free memory.
         require(afterHundred + (16ULL << 20) >= afterSecond, "GPU free memory declined by over 16 MiB");
-        runtime.unload();
-        require(runtime.datasetBytes() == 0 && !runtime.loaded(), "Unload retained dataset allocations");
+        runtime.unloadPair(runtime.pairs().begin()->first);
+        require(runtime.datasetBytes() == 0 && runtime.pairs().empty(), "Unload retained dataset allocations");
         const auto unloadedBaseline = freeBytes();
         for (int cycle = 0; cycle < 5; ++cycle) {
-            runtime.load(argv[1], argv[2]);
+            runtime.loadPair("small", argv[1], argv[2]);
             rejected = false;
-            try { runtime.query(a, b); } catch (const std::exception&) { rejected = true; }
+            try { runtime.queryPair(a); } catch (const std::exception&) { rejected = true; }
             require(rejected, "Stale handles accepted");
-            require(pairs(runtime.query(runtime.handleA(), runtime.handleB())) == expected, "Reload differs");
-            runtime.unload();
+            require(pairs(runtime.queryPair(runtime.pairs().begin()->second->handle)) == expected, "Reload differs");
+            runtime.unloadPair(runtime.pairs().begin()->first);
             require(runtime.datasetBytes() == 0, "Unload did not release tracked allocations");
         }
         require(freeBytes() + (16ULL << 20) >= unloadedBaseline, "Reload cycles leaked GPU memory");
         rejected = false;
-        try { runtime.load(argv[1], std::string(argv[2]) + ".missing"); }
+        try { runtime.loadPair("small", argv[1], std::string(argv[2]) + ".missing"); }
         catch (const std::exception&) { rejected = true; }
-        require(rejected && !runtime.loaded() && runtime.datasetBytes() == 0, "Pair load was not atomic");
+        require(rejected && runtime.pairs().empty() && runtime.datasetBytes() == 0, "Pair load was not atomic");
         auto zero = RaySpace::IO::readBinaryFile(argv[2]);
         for (auto& vertex : zero.vertices) vertex.x += 10000;
         for (auto& edge : zero.edges.edgeStarts) edge.x += 10000;
         for (auto& edge : zero.edges.edgeEnds) edge.x += 10000;
         zero.grid.hasGrid = false;
         require(RaySpace::IO::writeBinaryFile(argv[4], zero), "Could not write zero fixture");
-        runtime.load(argv[1], argv[4]);
-        require(runtime.query(runtime.handleA(), runtime.handleB()).pairs.empty(), "Zero fixture returned pairs");
-        runtime.unload();
+        runtime.loadPair("small", argv[1], argv[4]);
+        require(runtime.queryPair(runtime.pairs().begin()->second->handle).pairs.empty(), "Zero fixture returned pairs");
+        runtime.unloadPair(runtime.pairs().begin()->first);
         std::cout << "PASS: 100 resident queries, full baseline/analytical pair equality, stable handles and indexes, "
                      "5 reload cycles, stale handles, atomic failure, zero results.\n"
                   << "Resident dataset GPU bytes: " << residentBytes << "; free bytes after queries 2/100: "

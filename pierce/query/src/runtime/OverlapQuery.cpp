@@ -18,8 +18,11 @@ QueryResults executeTwoPassQueryEdgesOptimized(
     int mesh1NumEdges,
     int mesh2NumEdges,
     PerformanceTimer* timer,
-    bool verbose
+    bool verbose,
+    pierce::MemoryBudget* budget
 ) {
+    if (budget) budget->check(pierce::checkedMultiply(
+        pierce::checkedAdd(mesh1NumEdges, mesh2NumEdges), sizeof(int) + sizeof(long long)), "query_counts");
     // PASS 1: Count collisions for edges
     int* d_edge_collision_counts_int = nullptr;
     CUDA_CHECK(cudaMalloc(&d_edge_collision_counts_int, (size_t)mesh1NumEdges * sizeof(int)));
@@ -75,7 +78,13 @@ QueryResults executeTwoPassQueryEdgesOptimized(
     }
 
     // PASS 2: Store results into merged buffer
-    long long total_all = total_edge_results + total_mesh2_results;
+    if (total_edge_results < 0 || total_mesh2_results < 0) throw std::overflow_error("Negative collision count");
+    const auto totalCount = pierce::checkedAdd(total_edge_results, total_mesh2_results);
+    if (totalCount > static_cast<pierce::Bytes>(std::numeric_limits<long long>::max()))
+        throw std::overflow_error("Collision count overflow");
+    long long total_all = static_cast<long long>(totalCount);
+    const auto resultBytes = pierce::checkedMultiply(static_cast<pierce::Bytes>(total_all), sizeof(MeshQueryResult));
+    if (budget) budget->check(pierce::checkedMultiply(resultBytes, 3), "query_results_and_sort");
     MeshQueryResult* d_merged_results = nullptr;
     std::unique_ptr<MeshQueryResult, DeviceRelease> own_results;
     if (total_all > 0) {
@@ -128,10 +137,10 @@ QueryResults executeTwoPassQueryEdgesOptimized(
         std::cout << "Deduplication: Found " << numUnique << " unique object pairs." << std::endl;
     }
 
-    unsigned long long resultBufferCapacity = total_edge_results + total_mesh2_results;
+    unsigned long long resultBufferCapacity = totalCount;
     // We allocate total_all for d_merged_results.
     // Total allocated bytes for result buffers in this pass:
-    unsigned long long resultBufferAllocatedBytes = (total_edge_results + total_mesh2_results) * sizeof(MeshQueryResult);
+    unsigned long long resultBufferAllocatedBytes = resultBytes;
 
     return {own_results.release(), numUnique, resultBufferCapacity, resultBufferAllocatedBytes};
 }

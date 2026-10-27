@@ -22,25 +22,60 @@ static std::string quote(const std::string& text) {
     return out.str();
 }
 
+static std::string memoryJson(const pierce::MemorySnapshot& m) {
+    std::ostringstream out;
+    out << "{\"device\":" << quote(m.device) << ",\"totalBytes\":" << m.total
+        << ",\"freeBytes\":" << m.free << ",\"reservedBytes\":" << m.reserve() << "}";
+    return out.str();
+}
+static std::string pairJson(const pierce::ResidentPair& p) {
+    std::ostringstream out;
+    out << "{\"key\":" << quote(p.key) << ",\"pairHandle\":" << quote(p.handle)
+        << ",\"datasetLoadUs\":" << p.loadUs << ",\"datasetGpuBytes\":" << p.allocatedBytes()
+        << ",\"completedQueries\":" << p.completedQueries << ",\"lastResult\":";
+    if (!p.completedQueries) out << "null";
+    else out << "{\"resultCount\":" << p.resultCount << ",\"queryExecutionUs\":" << p.queryExecutionUs
+             << ",\"benchmarkPhaseSumUs\":" << p.benchmarkPhaseSumUs << ",\"rawHitCount\":" << p.rawHitCount
+             << ",\"resultBufferBytes\":" << p.resultBufferBytes << "}";
+    out << "}";
+    return out.str();
+}
+static std::string statusJson(pierce::QueryRuntime* runtime, long long initializationUs) {
+    std::ostringstream out;
+    out << "{\"runtimeInitializationUs\":" << initializationUs << ",\"pairs\":[";
+    bool first = true;
+    if (runtime) for (const auto& entry : runtime->pairs()) {
+        if (!first) out << ',';
+        first = false;
+        out << pairJson(*entry.second);
+    }
+    out << "],\"datasetReads\":" << (runtime ? runtime->reads() : 0)
+        << ",\"datasetUploads\":" << (runtime ? runtime->uploads() : 0)
+        << ",\"indexBuilds\":" << (runtime ? runtime->builds() : 0)
+        << ",\"pipelineCreations\":" << (runtime ? 1 : 0)
+        << ",\"completedQueries\":" << (runtime ? runtime->queries() : 0)
+        << ",\"datasetGpuBytes\":" << (runtime ? runtime->datasetBytes() : 0)
+        << ",\"runtimeGpuBytes\":" << (runtime ? runtime->runtimeBytes() : 0)
+        << ",\"temporaryQueryGpuBytes\":0,\"memory\":" << (runtime ? memoryJson(runtime->memory()) : "null")
+        << ",\"checkpoints\":[";
+    first = true;
+    if (runtime) for (const auto& point : runtime->checkpoints()) {
+        if (!first) out << ',';
+        first = false;
+        out << "{\"stage\":" << quote(point.stage) << ",\"requiredBytes\":" << point.required
+            << ",\"memory\":" << memoryJson(point.memory) << "}";
+    }
+    out << "]}";
+    return out.str();
+}
 int main(int argc, char** argv) {
     std::string ptx = detectPTXPath("mesh_overlap_edges.ptx");
     if (argc == 3 && std::string(argv[1]) == "--ptx") ptx = argv[2];
     else if (argc != 1) { std::cerr << "Usage: pierce_worker [--ptx file]\n"; return 1; }
-    // Existing native helpers write to cout. Keep an independent protocol stream
-    // before redirecting cout, so no library diagnostic can corrupt framing.
     std::ostream protocol(std::cout.rdbuf());
     std::cout.rdbuf(std::cerr.rdbuf());
     std::unique_ptr<pierce::QueryRuntime> runtime;
-    long long initializationUs = 0, loadUs = 0;
-    auto ensureRuntime = [&]() {
-        if (!runtime) {
-            auto start = std::chrono::steady_clock::now();
-            runtime = std::make_unique<pierce::QueryRuntime>(ptx);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            initializationUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - start).count();
-        }
-    };
+    long long initializationUs = 0;
     std::string line;
     while (std::getline(std::cin, line)) {
         std::string id;
@@ -50,48 +85,44 @@ int main(int argc, char** argv) {
             std::istringstream input(line);
             boost::property_tree::read_json(input, request);
             id = request.get<std::string>("id");
-            if (id.empty() || request.get<int>("version") != 1)
-                throw std::runtime_error("Expected nonempty id and protocol version 1");
-            auto command = request.get<std::string>("command");
-            std::ostringstream data;
+            if (id.empty() || request.get<int>("version") != 2)
+                throw std::runtime_error("Expected nonempty id and protocol version 2");
+            const auto command = request.get<std::string>("command");
             if (command == "load") {
-                const auto a = request.get<std::string>("mesh1");
-                const auto b = request.get<std::string>("mesh2");
-                if (a.empty() || b.empty()) throw std::runtime_error("Both paths are required");
-                ensureRuntime();
-                if (!runtime->loaded()) loadUs = runtime->load(a, b);
-                data << "{\"handleA\":" << quote(runtime->handleA()) << ",\"handleB\":" << quote(runtime->handleB())
-                     << ",\"datasetLoadUs\":" << loadUs << ",\"runtimeInitializationUs\":" << initializationUs << "}";
+                auto key = request.get<std::string>("key");
+                auto a = request.get<std::string>("mesh1"), b = request.get<std::string>("mesh2");
+                if (key.empty() || a.empty() || b.empty()) throw std::runtime_error("Key and both paths are required");
+                if (!runtime) {
+                    const auto start = std::chrono::steady_clock::now();
+                    runtime = std::make_unique<pierce::QueryRuntime>(ptx);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    initializationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+                }
+                runtime->loadPair(key, a, b);
             } else if (command == "query") {
-                if (!runtime) throw std::runtime_error("Load datasets before querying");
-                auto result = runtime->query(request.get<std::string>("handleA"), request.get<std::string>("handleB"));
-                data << "{\"resultCount\":" << result.pairs.size() << ",\"queryExecutionUs\":" << result.queryExecutionUs
-                     << ",\"benchmarkPhaseSumUs\":" << result.benchmarkPhaseSumUs << "}";
+                if (!runtime) throw std::runtime_error("Load a pair before querying");
+                runtime->queryPair(request.get<std::string>("pairHandle"));
             } else if (command == "unload") {
-                if (runtime) runtime->unload();
-                loadUs = 0;
-                data << "{\"loaded\":false}";
-            } else if (command == "status") {
-                const bool loaded = runtime && runtime->loaded();
-                data << "{\"loaded\":" << (loaded ? "true" : "false")
-                     << ",\"handleA\":" << quote(runtime ? runtime->handleA() : "")
-                     << ",\"handleB\":" << quote(runtime ? runtime->handleB() : "")
-                     << ",\"datasetReads\":" << (runtime ? runtime->reads() : 0)
-                     << ",\"datasetUploads\":" << (runtime ? runtime->uploads() : 0)
-                     << ",\"indexBuilds\":" << (runtime ? runtime->builds() : 0)
-                     << ",\"pipelineCreations\":" << (runtime ? 1 : 0)
-                     << ",\"completedQueries\":" << (runtime ? runtime->queries() : 0)
-                     << ",\"datasetGpuBytes\":" << (runtime ? runtime->datasetBytes() : 0)
-                     << ",\"runtimeGpuBytes\":" << (runtime ? runtime->runtimeBytes() : 0)
-                     << ",\"temporaryQueryGpuBytes\":0}";
+                if (!runtime) throw std::runtime_error("Pair is unloaded");
+                runtime->unloadPair(request.get<std::string>("pairHandle"));
             } else if (command == "shutdown") {
                 runtime.reset();
-                data << "{}";
                 shutdown = true;
-            } else throw std::runtime_error("Unknown command");
-            protocol << "{\"version\":1,\"id\":" << quote(id) << ",\"ok\":true,\"data\":" << data.str() << "}\n" << std::flush;
+            } else if (command != "status") throw std::runtime_error("Unknown command");
+            protocol << "{\"version\":2,\"id\":" << quote(id) << ",\"ok\":true,\"data\":"
+                     << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
+        } catch (const pierce::MemoryBudgetExceeded& error) {
+            const auto& point = error.checkpoint;
+            protocol << "{\"version\":2,\"id\":" << quote(id)
+                << ",\"ok\":false,\"error\":" << quote(error.what())
+                << ",\"code\":\"memory_budget_exceeded\",\"details\":{\"stage\":" << quote(point.stage)
+                << ",\"requiredBytes\":" << point.required << ",\"availableBytes\":" << point.memory.available()
+                << ",\"reservedBytes\":" << point.memory.reserve() << "},\"data\":"
+                << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
         } catch (const std::exception& error) {
-            protocol << "{\"version\":1,\"id\":" << quote(id) << ",\"ok\":false,\"error\":" << quote(error.what()) << "}\n" << std::flush;
+            protocol << "{\"version\":2,\"id\":" << quote(id) << ",\"ok\":false,\"code\":\"native_error\",\"error\":"
+                     << quote(error.what()) << ",\"data\":" << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
         }
         if (shutdown) break;
     }

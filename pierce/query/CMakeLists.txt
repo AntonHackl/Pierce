@@ -129,7 +129,7 @@ set(RAYTRACING_SOURCES
 
 # Runtime sources
 set(RUNTIME_SOURCES
-    ${SRC_DIR}/runtime/GeometryIO.cpp)
+    ${SRC_DIR}/runtime/GeometryIO.cpp ${SRC_DIR}/runtime/MemoryBudget.cpp)
 
 # -----------------------------------------------------------------------
 # PTX Compilation
@@ -162,6 +162,9 @@ add_library(pierce_query_runtime STATIC
     ${MESH_QUERY_DEDUP_SOURCE} ${SCAN_UTILS_SOURCE})
 add_executable(pierce_overlap_two_pass ${MESH_OVERLAP_APP_SOURCE})
 add_executable(pierce_worker ${SRC_DIR}/applications/pierce_worker_main.cpp)
+add_executable(pierce_multi_verify ${SRC_DIR}/applications/pierce_multi_verify.cpp)
+target_link_libraries(pierce_multi_verify PRIVATE pierce_query_runtime)
+set_target_properties(pierce_multi_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_executable(pierce_runtime_verify ${SRC_DIR}/applications/pierce_runtime_verify.cpp)
 target_link_libraries(pierce_runtime_verify PRIVATE pierce_query_runtime)
 set_target_properties(pierce_runtime_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -209,7 +212,7 @@ add_executable(pierce_containment
     ${SCAN_UTILS_SOURCE}
     ${ESTIMATED_INTERSECTION_SOURCE})
 
-foreach(TARGET_NAME pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
+foreach(TARGET_NAME pierce_multi_verify pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     target_include_directories(${TARGET_NAME} PRIVATE 
         ${CUDAToolkit_INCLUDE_DIRS}
         ${OptiX_INCLUDE} 
@@ -286,6 +289,6 @@ add_custom_target(copy_ptx ALL
     DEPENDS ${PTX_FILES}
     COMMENT "Copying PTX files to runtime bin directory..."
 )
-foreach(TARGET_NAME pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
+foreach(TARGET_NAME pierce_multi_verify pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     add_dependencies(${TARGET_NAME} copy_ptx)
 endforeach()

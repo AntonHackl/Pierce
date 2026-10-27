@@ -1,6 +1,7 @@
 #pragma once
 #include "../raytracing/MeshOverlapEdgesLauncher.h"
 #include "../timer.h"
+#include "MemoryBudget.h"
 
 struct QueryResults {
     MeshQueryResult* d_merged_results;
@@ -11,4 +12,4 @@ struct QueryResults {
 
 QueryResults executeTwoPassQueryEdgesOptimized(
     MeshOverlapEdgesLauncher&, MeshOverlapEdgesLaunchParams&, MeshOverlapEdgesLaunchParams&,
-    int, int, PerformanceTimer* timer = nullptr, bool verbose = true);
+    int, int, PerformanceTimer* timer = nullptr, bool verbose = true, pierce::MemoryBudget* budget = nullptr);

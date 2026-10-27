@@ -1,66 +1,89 @@
 # Persistent exact-overlap runtime
 
-The `pierce_query_runtime` CMake library contains the shared two-pass overlap
-implementation and `pierce::QueryRuntime`. The original `pierce_overlap_two_pass`
-CLI uses the shared query implementation while retaining its setup order, warmups,
-CSV output, and benchmark measurements. Other query applications remain separate.
+`pierce_query_runtime` supplies the two-pass overlap implementation shared by
+`pierce_overlap_two_pass` and the persistent worker. The benchmark CLI retains its
+arguments, setup order, warmups, CSV export, and historical timing definitions.
+The runtime's preflight memory policy is opt-in at the query/build helper level;
+the CLI does not enable it. Other query applications retain their default behavior.
 
-`QueryRuntime` owns its OptiX context, overlap pipeline, and at most one dataset
-pair. `load(a, b)` reads prepared `.pre` files, uploads meshes and unique edges,
-and builds both indexes. It commits the pair only after both loads succeed.
-`query(handleA, handleB)` returns unique pairs, complete synchronized native
-execution time, and the historical benchmark phase sum. Fresh launch parameters
-and temporary buffers are used each time; datasets and the pipeline are reused.
-`unload()` releases datasets. Destruction releases datasets before their pipeline
-and context. Calls must be serialized on one owning thread; objects are not
-thread-safe or copyable. No warmup is implicit.
+## Ownership and API
 
-## Worker protocol (version 1)
+`pierce::QueryRuntime` owns one OptiX context and overlap pipeline, plus a registry
+of independently owned `ResidentPair` objects. `loadPair(key, pathA, pathB)` returns
+a stable pair reference and an opaque handle. The pair is registered only after
+both datasets load, upload, and build successfully. Loading the same key/paths is
+idempotent; changing paths under a resident key is rejected. Query and unload use
+`queryPair(handle)` and `unloadPair(handle)`. Stale/unknown handles are rejected.
+
+Each pair retains its load measurement, completed-query count, last successful
+query metrics, and explicitly owned resident bytes. `RuntimeResult` returns the
+full unique object-pair vector plus timings and raw result-buffer measurements.
+Worker responses transmit only metrics. Every query constructs fresh parameters
+and temporary buffers; the resident meshes, edges, BVHs, and pipeline are reused.
+Failed query budgeting leaves previous successful metrics intact.
+
+Calls must be serialized on one owning thread. Pairs remain at stable addresses
+and are destroyed before their pipeline/context. No implicit warmup or eviction
+occurs. Pipeline initialization happens on the worker's first Load.
+
+## Worker protocol, version 2
 
 Run `pierce_worker [--ptx path/to/mesh_overlap_edges.ptx]`. Send one UTF-8 JSON
-object per line on stdin; read one response line per request from stdout. All
-native diagnostic output is redirected to stderr, which clients must drain.
-The context and pipeline are initialized lazily on the first Load command.
+object per line on stdin; read one response per request from stdout. Existing
+native diagnostics are redirected to stderr, which clients must continuously drain.
 
-Every request contains `version: 1`, a nonempty string `id`, and `command`.
-Success responses contain `{ "version": 1, "id": "...", "ok": true, "data": {} }`.
-Recoverable errors contain `ok: false` and an `error` string instead of `data`.
-Malformed requests use an empty ID if it could not be parsed. Fatal CUDA/OptiX
-errors terminate the worker; clients must invalidate all handles and restart.
-EOF also shuts the worker down.
+Requests contain `version: 2`, a nonempty string `id`, and `command`:
 
-| Command | Additional request fields | Success data |
+| Command | Additional request fields | Behavior |
 | --- | --- | --- |
-| `load` | `mesh1`, `mesh2`: prepared paths | `handleA`, `handleB`, `datasetLoadUs`, `runtimeInitializationUs` |
-| `query` | `handleA`, `handleB` | `resultCount`, `queryExecutionUs`, `benchmarkPhaseSumUs` |
-| `unload` | none | `loaded: false` |
-| `status` | none | loaded state, handles, lifecycle counters, explicitly owned GPU buffer bytes |
-| `shutdown` | none | empty object, then clean exit |
+| `load` | `key`, `mesh1`, `mesh2` | Atomically register a pair, or reuse the same key/paths |
+| `query` | `pairHandle` | Query that pair's A/B collections |
+| `unload` | `pairHandle` | Remove only that pair |
+| `status` | none | Observe registry, counters, memory, and allocation checkpoints |
+| `shutdown` | none | Release all resources and exit after replying |
 
-Load while a pair is resident returns its original handles and measurements;
-unload before selecting new files. Unload is idempotent. Handles change after
-reload and between runtime instances. The worker sends counts and timing only;
-the C++ API returns full object pairs for integration and verification tools.
+Success replies contain `{ "version": 2, "id": "...", "ok": true, "data": ... }`.
+Every success includes a complete status snapshot: `pairs`, lifetime lifecycle
+counters, `runtimeInitializationUs`, explicitly owned dataset/runtime bytes,
+`memory`, and `checkpoints`. Before initialization `memory` is null. After shutdown
+pairs are empty and memory is null. Each pair has `key`, `pairHandle`,
+`datasetLoadUs`, `datasetGpuBytes`, `completedQueries`, and nullable `lastResult`.
+The latter contains `resultCount`, `queryExecutionUs`, `benchmarkPhaseSumUs`,
+`rawHitCount`, and `resultBufferBytes`.
 
-`status` exposes `datasetReads`, `datasetUploads`, `indexBuilds`,
-`pipelineCreations`, and `completedQueries` for the worker lifetime. Failed loads
-can increment work counters for work performed before failure. It also reports
-`datasetGpuBytes`, `runtimeGpuBytes` (explicit pipeline/SBT parameter buffers),
-and `temporaryQueryGpuBytes` (zero between synchronous commands). Driver/context
-and internal OptiX allocations are excluded from explicit byte accounting.
+Recoverable errors have `ok: false`, `code`, an `error` message, and the surviving
+status in `data`. Memory errors use `code: "memory_budget_exceeded"` with `details`
+containing `stage`, `requiredBytes`, `availableBytes` (after reserve), and
+`reservedBytes`. Other request/load errors use `native_error`. Unparseable requests
+may have an empty ID. Fatal CUDA/OptiX failures terminate the process; clients must
+invalidate every handle. EOF also releases resources and exits.
+
+## Memory checks
+
+`MemoryBudget` reserves `max(512 MiB, 10% of total CUDA memory)` and supports an
+injected `MemoryProvider` for deterministic rejection tests. Upload guards cover
+mesh/edge allocations; BVH guards use OptiX's exact reported output and temporary
+build sizes. Queries check count/offset buffers before allocation, then check the
+raw result bytes plus twice that size as estimated sorting workspace after hit
+counting. Byte additions/multiplications are checked for overflow.
+
+Allocation checkpoints record stage, requested bytes, and observed device memory.
+Status reports device name, total/free/reserved bytes. Explicit accounting excludes
+driver/context and internal OptiX allocations; temporary query buffers are zero
+between commands. Checkpoints and snapshots are observations, not exact peak GPU
+usage. External allocations can race a successful preflight check; unexpected
+CUDA allocation errors retain the existing fatal-process behavior.
 
 ## Verification
 
-Build the query project normally, then run:
+`pierce_runtime_verify a.pre b.pre baseline.csv zero.pre` checks the fixed small
+cube workload, 100 full-pair comparisons, reloads, failure paths, and zero results.
 
-```text
-pierce_runtime_verify a.pre b.pre baseline.csv zero.pre
-```
-
-This compares all pairs with the baseline CSV and the analytical 1,000-by-1,000
-cube workload over 100 queries, checks stable residency, exercises reload and
-failure paths, and writes a spatially separated zero-result fixture. Memory
-checks allow 16 MiB of global free-memory variation from caches/other GPU clients.
-Explorer's `python -m backend.verify_gpu` additionally tests the CLI and worker
-protocol end to end. Capture the old CLI's exported CSV before refactoring when
-an independent previous-version comparison is required.
+`pierce_multi_verify small-a small-b large-a large-b small.csv large.csv` checks
+100 alternating full-pair comparisons, independent pair lifetimes, exactly four
+initial reads/uploads/builds, injected upload/BVH/edge/count/result-budget
+rejections, cleanup/recovery, stale handles, checked arithmetic, and reload cycles.
+Global CUDA free-memory checks allow 16 MiB of variation; explicitly owned bytes
+must return exactly to prior values. Run the verifiers on an otherwise idle GPU.
+Explorer's `python -m backend.verify_gpu` captures CLI baselines and also runs 100
+alternating real API/worker queries, recording results and memory observations.

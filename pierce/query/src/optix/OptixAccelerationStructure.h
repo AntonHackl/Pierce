@@ -6,6 +6,8 @@
 #include "GeometryUploader.h"
 #include "OptixContext.h"
 
+namespace pierce { class MemoryBudget; }
+
 class OptixAccelerationStructure {
 public:
     OptixAccelerationStructure(OptixContext& context, GeometryUploader& geometry);
@@ -19,7 +21,7 @@ public:
     bool isValid() const { return gasHandle_ != 0; }
     
     // Build from geometry uploader (already uploaded to GPU)
-    void build();
+    void build(pierce::MemoryBudget* budget = nullptr);
     
 private:
     OptixContext& context_;
@@ -30,7 +32,7 @@ private:
     size_t tempSize_;
     size_t outputSize_;
     
-    void buildInternal();
+    void buildInternal(pierce::MemoryBudget* budget);
     void freeInternal();
 };
 
