@@ -58,6 +58,7 @@ void OptixAccelerationStructure::buildInternal(pierce::MemoryBudget* budget) {
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_gasOutput_), gasSizes.outputSizeInBytes));
     
     tempSize_ = gasSizes.tempSizeInBytes;
+    buildScratchBytes_ = tempSize_;
     outputSize_ = gasSizes.outputSizeInBytes;
     
     OPTIX_CHECK(optixAccelBuild(context_.getContext(), 0, &accelOptions, &buildInput, 1,

@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
         };
         pierce::QueryRuntime runtime(detectPTXPath("mesh_overlap_edges.ptx"), provider);
         const auto before = runtime.memory();
-        const auto small = runtime.loadPair("small", argv[1], argv[2]).handle;
+        auto small = runtime.loadPair("small", argv[1], argv[2]).handle;
         const auto large = runtime.loadPair("large", argv[3], argv[4]).handle;
         const auto owned = runtime.datasetBytes();
         const auto both = runtime.memory();
@@ -92,15 +92,18 @@ int main(int argc, char** argv) {
         require(runtime.pair(small).completedQueries == 50 && runtime.pair(large).completedQueries == 50, "Per-pair counts changed");
         require(runtime.memory().free + (16ULL << 20) >= afterWarm, "Memory grew during switching");
         // Fail after the first collection has loaded: pending pair must unwind.
-        const auto survivorBytes = runtime.datasetBytes();
+        runtime.unloadPair(small);
+        const auto residentLarge = runtime.datasetBytes();
         for (const auto& failure : std::vector<std::pair<std::string,int>>{{"dataset_upload",1},{"dataset_upload",2},{"bvh_build",1},{"edge_upload",1}}) {
             denyStage = failure.first; denyAfter = failure.second;
             bool denied = false;
             try { runtime.loadPair("rejected", argv[1], argv[2]); } catch (const pierce::MemoryBudgetExceeded&) { denied = true; }
-            require(denied && runtime.pairs().size() == 2 && runtime.datasetBytes() == survivorBytes, "Failed load changed residents");
+            require(denied && runtime.pairs().size() == 1 && runtime.datasetBytes() == residentLarge, "Failed load changed residents");
             denyStage.clear();
-            require(canonical(runtime.queryPair(small).pairs) == smallExpected, "Query after failed load changed");
+            require(canonical(runtime.queryPair(large).pairs) == largeExpected, "Query after failed load changed");
         }
+        small = runtime.loadPair("small", argv[1], argv[2]).handle;
+        const auto survivorBytes = runtime.datasetBytes();
         for (const char* stage : {"query_estimation", "query_hash_table", "query_compaction"}) {
             denyStage = stage; denyAfter = 1;
             auto freeBefore = runtime.memory().free;

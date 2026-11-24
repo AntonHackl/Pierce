@@ -84,7 +84,15 @@ int main(int argc, char** argv) {
         auto zero = RaySpace::IO::readBinaryFile(argv[2]);
         zero.grid.hasGrid = false;
         require(RaySpace::IO::writeBinaryFile(argv[4], zero), "Could not write underestimation fixture");
+        const auto ab = runtime.loadPair("AB", argv[1], argv[2]).handle;
+        const auto buildsBeforeAC = runtime.builds();
+        require(runtime.pair(ab).a->geometry.vertices.empty() &&
+                runtime.pair(ab).a->geometry.edges.edgeStarts.empty(), "Host staging arrays retained");
         const auto underestimated = runtime.loadPair("underestimate", argv[1], argv[4]).handle;
+        require(runtime.builds() == buildsBeforeAC + 1 &&
+                runtime.pair(ab).a == runtime.pair(underestimated).a, "A was not reused");
+        require(pairs(runtime.queryPair(ab)) == expected, "A-B changed after loading A-C");
+        runtime.unloadPair(ab);
         auto recovered = runtime.queryPair(underestimated);
         require(recovered.estimatedPairCount == 0 && recovered.hashTableBytes > 1025 * sizeof(unsigned long long)
                 && recovered.rawHitCount == 70000 && pairs(recovered) == expected,

@@ -18,6 +18,7 @@ public:
     
     OptixTraversableHandle getHandle() const { return gasHandle_; }
     size_t allocatedBytes() const { return outputSize_ + tempSize_; }
+    size_t buildScratchBytes() const { return buildScratchBytes_; }
     bool isValid() const { return gasHandle_ != 0; }
     
     // Build from geometry uploader (already uploaded to GPU)
@@ -30,6 +31,7 @@ private:
     CUdeviceptr d_tempBuffer_;
     CUdeviceptr d_gasOutput_;
     size_t tempSize_;
+    size_t buildScratchBytes_ = 0;
     size_t outputSize_;
     
     void buildInternal(pierce::MemoryBudget* budget);

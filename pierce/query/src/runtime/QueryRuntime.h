@@ -4,6 +4,7 @@
 #include "../geometry/PrecomputedEdgeData.h"
 #include "../raytracing/MeshOverlapEdgesLauncher.h"
 #include "MemoryBudget.h"
+#include <filesystem>
 #include <memory>
 #include <chrono>
 #include <map>
@@ -11,12 +12,21 @@
 #include <vector>
 
 namespace pierce {
+struct DatasetVersion {
+    std::filesystem::path path;
+    std::filesystem::file_time_type modified;
+    std::uintmax_t size;
+    bool operator==(const DatasetVersion& other) const {
+        return path == other.path && modified == other.modified && size == other.size;
+    }
+};
 struct ResidentDataset {
+    const DatasetVersion version;
     GeometryData geometry;
     GeometryUploader uploader;
     OptixAccelerationStructure index;
     EdgeMeshData edges;
-    ResidentDataset(OptixContext& context, const std::string& path, MemoryBudget& budget);
+    ResidentDataset(OptixContext& context, DatasetVersion version, MemoryBudget& budget, bool retainHostGeometry);
     ~ResidentDataset();
     size_t allocatedBytes() const;
 };
@@ -32,13 +42,13 @@ struct RuntimeResult {
 };
 struct ResidentPair {
     std::string key, handle, pathA, pathB;
-    std::unique_ptr<ResidentDataset> a, b;
+    std::shared_ptr<ResidentDataset> a, b;
     long long loadUs = 0;
     Bytes completedQueries = 0, resultCount = 0, rawHitCount = 0, resultBufferBytes = 0;
     Bytes estimatedPairCount = 0, hashTableBytes = 0;
     long long queryExecutionUs = 0, benchmarkPhaseSumUs = 0;
     QueryPhaseTimings phaseTimings;
-    size_t allocatedBytes() const { return checkedAdd(a->allocatedBytes(), b->allocatedBytes()); }
+    size_t allocatedBytes() const { return a == b ? a->allocatedBytes() : checkedAdd(a->allocatedBytes(), b->allocatedBytes()); }
 };
 // All operations run on one owning thread. Declaration order destroys resident
 // pairs before the shared pipeline/context. Pair objects stay at stable addresses.
@@ -47,11 +57,13 @@ class QueryRuntime {
     MeshOverlapEdgesLauncher launcher_;
     MemoryBudget budget_;
     std::map<std::string, std::unique_ptr<ResidentPair>> pairs_;
+    const bool retainHostGeometry_;
+    std::shared_ptr<ResidentDataset> loadDataset(DatasetVersion version);
     const std::string identity_ = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     Bytes generation_ = 0, reads_ = 0, uploads_ = 0, builds_ = 0, queries_ = 0;
 public:
-    explicit QueryRuntime(const std::string& ptx, MemoryProvider provider = {})
-        : launcher_(context_, ptx), budget_(std::move(provider)) {}
+    explicit QueryRuntime(const std::string& ptx, MemoryProvider provider = {}, bool retainHostGeometry = false)
+        : launcher_(context_, ptx), budget_(std::move(provider)), retainHostGeometry_(retainHostGeometry) {}
     const ResidentPair& loadPair(const std::string& key, const std::string& a, const std::string& b);
     void unloadPair(const std::string& handle);
     RuntimeResult queryPair(const std::string& handle);

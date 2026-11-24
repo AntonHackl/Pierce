@@ -37,7 +37,8 @@ static float calculateGlobalAvgVolRatio(const std::vector<SparseGridEntry>& spar
 }
 
 long long estimateOverlapPairs(const GridData& a, const GridData& b, float epsilon,
-                               float gamma, bool useAlphaCorrection, MemoryBudget* budget) {
+                               float gamma, bool useAlphaCorrection, MemoryBudget* budget, EstimationMemory* memory) {
+    if (memory) *memory = {};
     if (!a.hasGrid || !b.hasGrid) return 0;
 
     struct Int3Hash {
@@ -60,6 +61,10 @@ long long estimateOverlapPairs(const GridData& a, const GridData& b, float epsil
         if (it == mapA.end()) continue;
         matchedA.push_back(it->second);
         matchedB.push_back(entry.stats);
+    }
+    if (memory) {
+        memory->gpuScratchBytes = matchedA.size() * (2 * sizeof(GridCell) + sizeof(float));
+        memory->hostMatchedCellBytes = (matchedA.capacity() + matchedB.capacity()) * sizeof(GridCell);
     }
     if (matchedA.empty()) return 0;
     if (matchedA.size() > std::numeric_limits<int>::max() - 255)

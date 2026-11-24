@@ -216,6 +216,7 @@ public:
     std::string pairsOutputPath;
     bool trackHashContention = false;
     bool trackRawHits = false;
+    bool profileMemory = false;
     bool useAlphaCorrection = true;
     unsigned long long manualHashTableSize = 0;
     float hashTableFreeMemFraction = 0.0f;
@@ -237,6 +238,7 @@ public:
         options.emplace_back("--hash-table-size <ull>", "Override hash table size (slots); 0 = auto-compute");
         options.emplace_back("--hash-table-free-mem-fraction <f>", "Use f in (0,1] of free GPU memory for hash table sizing");
         options.emplace_back("--overlap-max-iterations <int>", "Overlap ray iteration cap (default: 100)");
+        options.emplace_back("--profile-memory", "Log component sizes and GPU initialization deltas");
         options.emplace_back("--estimate-only", "Only run selectivity estimation, skip actual query");
         appendHelpFlag(options);
 
@@ -250,6 +252,10 @@ public:
 
 protected:
     bool parseApplicationOption(const std::string& arg, int& i, int argc, char* argv[]) override {
+        if (arg == "--profile-memory") {
+            profileMemory = true;
+            return true;
+        }
         if (arg == "--gamma" && i + 1 < argc) {
             gamma = std::stof(argv[++i]);
             return true;
@@ -366,8 +372,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    pierce::EstimationMemory estimationMemory;
     auto estimatePairs = [&] {
-        return pierce::estimateOverlapPairs(mesh1.grid, mesh2.grid, epsilon, gamma, useAlphaCorrection);
+        return pierce::estimateOverlapPairs(mesh1.grid, mesh2.grid, epsilon, gamma, useAlphaCorrection, nullptr, options.profileMemory ? &estimationMemory : nullptr);
     };
 
     auto computeHashTableSize = [&](long long estimatedPairs) -> unsigned long long {
@@ -414,7 +421,17 @@ int main(int argc, char* argv[]) {
 
     // --- EXECUTION PHASE ---
     timer.next("Init OptiX");
+    auto freeDeviceBytes = [&] {
+        size_t freeBytes = 0, totalBytes = 0;
+        if (options.profileMemory) CUDA_CHECK(cudaMemGetInfo(&freeBytes, &totalBytes));
+        return freeBytes;
+    };
+    auto memoryDelta = [](size_t before, size_t after) {
+        return static_cast<long long>(before) - static_cast<long long>(after);
+    };
+    const auto beforeContext = freeDeviceBytes();
     OptixContext context;
+    const auto afterContext = freeDeviceBytes();
 
     timer.next("Upload Mesh1");
     GeometryUploader mesh1Uploader;
@@ -443,7 +460,18 @@ int main(int argc, char* argv[]) {
     std::cout << "Mesh2 edges uploaded: " << mesh2NumEdges << " unique edges" << std::endl;
 
     timer.next("Create Edge Launcher");
+    const auto beforeLauncher = freeDeviceBytes();
     MeshOverlapEdgesLauncher edgesLauncher(context, options.ptxPath);
+    const auto afterLauncher = freeDeviceBytes();
+    if (options.profileMemory) {
+        std::cout << "Memory BVH A bytes: " << mesh1AS.allocatedBytes()
+                  << "\nMemory BVH B bytes: " << mesh2AS.allocatedBytes()
+                  << "\nMemory build scratch A bytes: " << mesh1AS.buildScratchBytes()
+                  << "\nMemory build scratch B bytes: " << mesh2AS.buildScratchBytes()
+                  << "\nMemory launcher GPU bytes: " << edgesLauncher.allocatedBytes()
+                  << "\nMemory OptiX context GPU delta: " << memoryDelta(beforeContext, afterContext)
+                  << "\nMemory launcher GPU delta: " << memoryDelta(beforeLauncher, afterLauncher) << '\n';
+    }
 
     timer.next("Prepare Kernel Parameters");
     int mesh1NumTriangles = static_cast<int>(mesh1Uploader.getNumIndices());
@@ -632,6 +660,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (options.profileMemory) {
+        std::cout << "Memory estimator GPU scratch bytes: " << estimationMemory.gpuScratchBytes
+                  << "\nMemory estimator host matched-cell bytes: " << estimationMemory.hostMatchedCellBytes << '\n';
+    }
     timer.finish(outputJsonPath);
     
     std::cout << "\nQuery completed in " << (double)timer.getTotalDuration() / 1000.0 << " ms." << std::endl;

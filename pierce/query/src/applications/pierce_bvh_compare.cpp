@@ -188,7 +188,7 @@ void run(char** args, int threads, bool parallelOnly) {
     if (repeats <= 0) throw std::runtime_error("Repetitions must be positive");
     const std::filesystem::path bin = args[3];
     logDeviceMemory("start");
-    pierce::QueryRuntime shared((bin/"mesh_overlap_edges.ptx").string());
+    pierce::QueryRuntime shared((bin/"mesh_overlap_edges.ptx").string(), {}, true);
     const auto& resident = shared.loadPair("scene",args[1],args[2]);
     logDeviceMemory("shared_loaded");
     OptixContext context;

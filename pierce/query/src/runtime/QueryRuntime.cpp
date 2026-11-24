@@ -4,6 +4,7 @@
 #include "../cuda/mesh_query_deduplication.h"
 #include <chrono>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 
 namespace {
@@ -31,29 +32,53 @@ MeshOverlapEdgesLaunchParams parameters(pierce::ResidentDataset& source,
 }
 
 namespace pierce {
-ResidentDataset::ResidentDataset(OptixContext& context, const std::string& path, MemoryBudget& budget)
-    : geometry(loadGeometryFromFile(path)), index(context, uploader) {
-    if (geometry.vertices.empty() || geometry.indices.empty() ||
-        geometry.triangleToObject.size() != geometry.indices.size() ||
-        !requirePrecomputedEdges(geometry, path, "Dataset"))
+static DatasetVersion datasetVersion(const std::string& input) {
+    auto path = std::filesystem::canonical(input);
+    return {path, std::filesystem::last_write_time(path), std::filesystem::file_size(path)};
+}
+
+ResidentDataset::ResidentDataset(OptixContext& context, DatasetVersion dataset, MemoryBudget& budget, bool retainHostGeometry)
+    : version(std::move(dataset)), index(context, uploader) {
+    const auto path = version.path.string();
+    auto loaded = loadGeometryFromFile(path);
+    if (loaded.vertices.empty() || loaded.indices.empty() ||
+        loaded.triangleToObject.size() != loaded.indices.size() ||
+        !requirePrecomputedEdges(loaded, path, "Dataset"))
         throw std::runtime_error("Invalid prepared dataset: " + path);
-    const auto meshBytes = checkedAdd(checkedMultiply(geometry.vertices.size(), sizeof(float3)),
-        checkedAdd(checkedMultiply(geometry.indices.size(), sizeof(uint3)),
-                   checkedMultiply(geometry.triangleToObject.size(), sizeof(int))));
-    const auto edgeBytes = checkedMultiply(geometry.edges.edgeStarts.size(), 2 * sizeof(float3) + sizeof(int));
+    const auto meshBytes = checkedAdd(checkedMultiply(loaded.vertices.size(), sizeof(float3)),
+        checkedAdd(checkedMultiply(loaded.indices.size(), sizeof(uint3)),
+                   checkedMultiply(loaded.triangleToObject.size(), sizeof(int))));
+    const auto edgeBytes = checkedMultiply(loaded.edges.edgeStarts.size(), 2 * sizeof(float3) + sizeof(int));
     budget.check(checkedAdd(meshBytes, edgeBytes), "dataset_upload");
-    uploader.upload(geometry);
+    uploader.upload(loaded);
     index.build(&budget);
     budget.check(edgeBytes, "edge_upload");
-    edges = PrecomputedEdgeData::uploadFromGeometry(geometry);
+    edges = PrecomputedEdgeData::uploadFromGeometry(loaded);
+    if (retainHostGeometry) geometry = std::move(loaded);
+    else geometry.grid = std::move(loaded.grid);
 }
 ResidentDataset::~ResidentDataset() { PrecomputedEdgeData::freeEdgeData(edges); }
 size_t ResidentDataset::allocatedBytes() const {
-    return checkedAdd(checkedAdd(checkedMultiply(geometry.vertices.size(), sizeof(float3)),
-        checkedMultiply(geometry.indices.size(), sizeof(uint3))),
-        checkedAdd(checkedMultiply(geometry.triangleToObject.size(), sizeof(int)),
-        checkedAdd(index.allocatedBytes(), checkedMultiply(geometry.edges.edgeStarts.size(), 2 * sizeof(float3) + sizeof(int)))));
+    const auto mesh = checkedAdd(checkedMultiply(uploader.getNumVertices(), sizeof(float3)),
+        checkedAdd(checkedMultiply(uploader.getNumIndices(), sizeof(uint3)),
+                   checkedMultiply(uploader.getNumTrianglesToObject(), sizeof(int))));
+    return checkedAdd(mesh, checkedAdd(index.allocatedBytes(),
+        checkedMultiply(edges.num_edges, 2 * sizeof(float3) + sizeof(int))));
 }
+
+std::shared_ptr<ResidentDataset> QueryRuntime::loadDataset(DatasetVersion version) {
+    for (const auto& entry : pairs_) {
+        const auto& pair = *entry.second;
+        if (pair.a->version == version) return pair.a;
+        if (pair.b->version == version) return pair.b;
+    }
+    ++reads_;
+    auto dataset = std::make_shared<ResidentDataset>(context_, std::move(version), budget_, retainHostGeometry_);
+    ++uploads_;
+    ++builds_;
+    return dataset;
+}
+
 const ResidentPair& QueryRuntime::loadPair(const std::string& key, const std::string& a, const std::string& b) {
     if (key.empty()) throw std::runtime_error("A nonempty pair key is required");
     for (const auto& entry : pairs_) {
@@ -69,12 +94,11 @@ const ResidentPair& QueryRuntime::loadPair(const std::string& key, const std::st
     auto pending = std::make_unique<ResidentPair>();
     pending->key = key; pending->pathA = a; pending->pathB = b;
     pending->handle = identity_ + "-" + std::to_string(++generation_);
-    ++reads_;
-    pending->a = std::make_unique<ResidentDataset>(context_, a, budget_);
-    ++uploads_; ++builds_;
-    ++reads_;
-    pending->b = std::make_unique<ResidentDataset>(context_, b, budget_);
-    ++uploads_; ++builds_;
+    auto versionA = datasetVersion(a);
+    auto versionB = datasetVersion(b);
+    const bool sameDataset = versionA == versionB;
+    pending->a = loadDataset(std::move(versionA));
+    pending->b = sameDataset ? pending->a : loadDataset(std::move(versionB));
     CUDA_CHECK(cudaDeviceSynchronize());
     pending->loadUs = elapsed(start);
     const auto handle = pending->handle;
@@ -94,7 +118,12 @@ void QueryRuntime::unloadPair(const std::string& handle) {
 }
 size_t QueryRuntime::datasetBytes() const {
     size_t bytes = 0;
-    for (const auto& entry : pairs_) bytes = checkedAdd(bytes, entry.second->allocatedBytes());
+    std::set<const ResidentDataset*> counted;
+    for (const auto& entry : pairs_) {
+        for (const auto* dataset : {entry.second->a.get(), entry.second->b.get()}) {
+            if (counted.insert(dataset).second) bytes = checkedAdd(bytes, dataset->allocatedBytes());
+        }
+    }
     return bytes;
 }
 RuntimeResult QueryRuntime::queryPair(const std::string& handle) {

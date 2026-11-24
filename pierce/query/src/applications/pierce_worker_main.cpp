@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 
 // PropertyTree is already supplied by Pierce's Boost dependency. Only request
@@ -46,7 +47,8 @@ static std::string pairJson(const pierce::ResidentPair& p) {
     out << "}";
     return out.str();
 }
-static std::string statusJson(pierce::QueryRuntime* runtime, long long initializationUs) {
+static std::string statusJson(pierce::QueryRuntime* runtime, long long initializationUs,
+                              const pierce::RuntimeResult* query = nullptr) {
     std::ostringstream out;
     out << "{\"runtimeInitializationUs\":" << initializationUs << ",\"pairs\":[";
     bool first = true;
@@ -71,7 +73,18 @@ static std::string statusJson(pierce::QueryRuntime* runtime, long long initializ
         out << "{\"stage\":" << quote(point.stage) << ",\"requiredBytes\":" << point.required
             << ",\"memory\":" << memoryJson(point.memory) << "}";
     }
-    out << "]}";
+    out << ']';
+    if (query) {
+        out << ",\"resultPairs\":[";
+        bool firstPair = true;
+        for (const auto& pair : query->pairs) {
+            if (!firstPair) out << ',';
+            firstPair = false;
+            out << '[' << pair.object_id_mesh1 << ',' << pair.object_id_mesh2 << ']';
+        }
+        out << ']';
+    }
+    out << '}';
     return out.str();
 }
 int main(int argc, char** argv) {
@@ -94,6 +107,7 @@ int main(int argc, char** argv) {
             if (id.empty() || request.get<int>("version") != 3)
                 throw std::runtime_error("Expected nonempty id and protocol version 3");
             const auto command = request.get<std::string>("command");
+            std::optional<pierce::RuntimeResult> query;
             if (command == "load") {
                 auto key = request.get<std::string>("key");
                 auto a = request.get<std::string>("mesh1"), b = request.get<std::string>("mesh2");
@@ -108,7 +122,8 @@ int main(int argc, char** argv) {
                 runtime->loadPair(key, a, b);
             } else if (command == "query") {
                 if (!runtime) throw std::runtime_error("Load a pair before querying");
-                runtime->queryPair(request.get<std::string>("pairHandle"));
+                auto result = runtime->queryPair(request.get<std::string>("pairHandle"));
+                if (request.get<bool>("includePairs", false)) query = std::move(result);
             } else if (command == "unload") {
                 if (!runtime) throw std::runtime_error("Pair is unloaded");
                 runtime->unloadPair(request.get<std::string>("pairHandle"));
@@ -117,7 +132,7 @@ int main(int argc, char** argv) {
                 shutdown = true;
             } else if (command != "status") throw std::runtime_error("Unknown command");
             protocol << "{\"version\":3,\"id\":" << quote(id) << ",\"ok\":true,\"data\":"
-                     << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
+                     << statusJson(runtime.get(), initializationUs, query ? &*query : nullptr) << "}\n" << std::flush;
         } catch (const pierce::MemoryBudgetExceeded& error) {
             const auto& point = error.checkpoint;
             protocol << "{\"version\":3,\"id\":" << quote(id)
