@@ -3,43 +3,7 @@
 #include <math.h>
 #include "optix_common_shaders.cuh"
 
-// Forward declaration of result type
-struct MeshQueryResult {
-    int object_id_mesh1;
-    int object_id_mesh2;
-};
-
-// Structure for edge-based launch parameters (must match MeshOverlapEdgesLaunchParams)
-struct MeshOverlapEdgesLaunchParams {
-    // Mesh1 edge data
-    float3* edge_starts;
-    float3* edge_ends;
-    int* edge_source_object_ids;
-    int num_edges;
-    
-    // Mesh2 acceleration structure
-    OptixTraversableHandle mesh2_handle;
-    float3* mesh2_vertices;
-    uint3* mesh2_indices;
-    int* mesh2_triangle_to_object;
-    
-    // Hash Table for on-the-fly deduplication
-    unsigned long long* hash_table;
-    unsigned long long hash_table_size;
-    int use_hash_table;
-    int use_bitwise_hash;
-    unsigned long long* hash_access_counter;
-    unsigned long long* hash_contention_counter;
-    int track_hash_contention;
-    
-    // Two-pass results
-    int* collision_counts;            // Per-edge collision counts
-    long long* collision_offsets;     // Exclusive scan of counts
-    MeshQueryResult* results;         // Actual collision pairs
-    int pass;                         // 1 = count only, 2 = write results
-    int swap_pair_order;              // 0: (source,target), 1: (target,source)
-    int overlap_max_iterations;
-};
+#include "../raytracing/MeshOverlapEdgesLaunchParams.h"
 
 extern "C" __constant__ MeshOverlapEdgesLaunchParams mesh_overlap_edges_params;
 
@@ -99,6 +63,9 @@ __device__ void insert_hash_table_edges(int id1, int id2) {
         } else {
             h = (h + 1) % (unsigned int)size;
         }
+    }
+    if (mesh_overlap_edges_params.hash_insert_failed) {
+        atomicExch(mesh_overlap_edges_params.hash_insert_failed, 1U);
     }
 }
 
@@ -202,6 +169,9 @@ extern "C" __global__ void __raygen__mesh_overlap_edges() {
         sourceObjectId,
         writeCursor);
     
+    if (totalHits && mesh_overlap_edges_params.raw_hit_counters) {
+        atomicAdd(&mesh_overlap_edges_params.raw_hit_counters[edgeIdx & (overlapRawHitShards - 1)], totalHits);
+    }
     if (!mesh_overlap_edges_params.use_hash_table && mesh_overlap_edges_params.pass == 1) {
         mesh_overlap_edges_params.collision_counts[edgeIdx] = totalHits;
     }

@@ -155,7 +155,7 @@ int main(int argc, char* argv[]) {
     int mesh2NumTriangles = static_cast<int>(mesh2Uploader.getNumIndices());
     
     // Prepare edge parameters for optimized query
-    MeshOverlapEdgesLaunchParams edgesParams1;
+    MeshOverlapEdgesLaunchParams edgesParams1{};
     edgesParams1.edge_starts = mesh1EdgeData.d_edge_starts;
     edgesParams1.edge_ends = mesh1EdgeData.d_edge_ends;
     edgesParams1.edge_source_object_ids = mesh1EdgeData.d_source_object_ids;
@@ -174,7 +174,7 @@ int main(int argc, char* argv[]) {
     edgesParams1.pass = 0;
     edgesParams1.swap_pair_order = 0;
 
-    MeshOverlapEdgesLaunchParams edgesParams2;
+    MeshOverlapEdgesLaunchParams edgesParams2{};
     edgesParams2.edge_starts = mesh2EdgeData.d_edge_starts;
     edgesParams2.edge_ends = mesh2EdgeData.d_edge_ends;
     edgesParams2.edge_source_object_ids = mesh2EdgeData.d_source_object_ids;

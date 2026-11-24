@@ -12,8 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <unordered_map>
 #include <iomanip>
+#include <numeric>
 #include <cuda_runtime.h>
 #include "../optix/OptixContext.h"
 #include "../optix/OptixAccelerationStructure.h"
@@ -28,7 +28,7 @@
 #include "../geometry/PrecomputedEdgeData.h"
 #include "../timer.h"
 #include "../ptx_utils.h"
-#include "../cuda/estimated_overlap.h"
+#include "../runtime/OverlapEstimation.h"
 #include "app_cli_options.h"
 
 struct QueryResults {
@@ -83,7 +83,8 @@ QueryResults executeHashQuery(
     QueryDirection direction,
     PerformanceTimer* timer = nullptr,
     bool verbose = true,
-    bool trackHashContention = false
+    bool trackHashContention = false,
+    bool trackRawHits = false
 ) {
     // Clear hash table (set to 0xFF which is our sentinel for empty)
     CUDA_CHECK(cudaMemset(d_hash_table, 0xFF, hash_table_size * sizeof(unsigned long long)));
@@ -116,6 +117,14 @@ QueryResults executeHashQuery(
     edgesParams2.hash_contention_counter = d_hash_contention_counter;
     edgesParams2.track_hash_contention = trackHashContention ? 1 : 0;
 
+    unsigned int* rawHitCounters = nullptr;
+    if (trackRawHits && timer) {
+        CUDA_CHECK(cudaMalloc(&rawHitCounters, 2 * overlapRawHitShards * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(rawHitCounters, 0, 2 * overlapRawHitShards * sizeof(unsigned int)));
+        edgesParams1.raw_hit_counters = rawHitCounters;
+        edgesParams2.raw_hit_counters = rawHitCounters + overlapRawHitShards;
+    }
+
     if (direction == QueryDirection::Both || direction == QueryDirection::Mesh1ToMesh2) {
         auto t0 = std::chrono::high_resolution_clock::now();
         edgesLauncher.launchMesh1ToMesh2(edgesParams1, mesh1NumEdges);
@@ -138,6 +147,16 @@ QueryResults executeHashQuery(
                 std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
             );
         }
+    }
+
+    if (rawHitCounters) {
+        std::vector<unsigned int> hits(2 * overlapRawHitShards);
+        CUDA_CHECK(cudaMemcpy(hits.data(), rawHitCounters, hits.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        const auto split = hits.begin() + overlapRawHitShards;
+        timer->addCounter("Raw_Hits_Mesh1ToMesh2", std::accumulate(hits.begin(), split, 0ULL));
+        timer->addCounter("Raw_Hits_Mesh2ToMesh1", std::accumulate(split, hits.end(), 0ULL));
+        CUDA_CHECK(cudaFree(rawHitCounters));
+        edgesParams1.raw_hit_counters = edgesParams2.raw_hit_counters = nullptr;
     }
 
     // Use estimated pairs to size the output buffer, with a fallback and a safety factor
@@ -186,38 +205,6 @@ QueryResults executeHashQuery(
     return {d_merged_results, numUnique, hashAccesses, hashContentions, static_cast<unsigned long long>(max_output)};
 }
 
-// Helper to calculate global average size of objects from grid statistics
-float calculateGlobalAvgSize(const std::vector<SparseGridEntry>& sparseCells) {
-    double totalSize = 0.0;
-    long long totalCount = 0;
-    
-    for (const auto& entry : sparseCells) {
-        if (entry.stats.TouchCount > 0) {
-            totalSize += (double)entry.stats.AvgSizeMean * (double)entry.stats.TouchCount;
-            totalCount += entry.stats.TouchCount;
-        }
-    }
-    
-    if (totalCount == 0) return 0.0f;
-    return (float)(totalSize / totalCount);
-}
-
-// Helper to calculate global average VolRatio from grid statistics
-float calculateGlobalAvgVolRatio(const std::vector<SparseGridEntry>& sparseCells) {
-    double totalRatio = 0.0;
-    long long totalCount = 0;
-    
-    for (const auto& entry : sparseCells) {
-        if (entry.stats.TouchCount > 0) {
-            totalRatio += (double)entry.stats.VolRatio * (double)entry.stats.TouchCount;
-            totalCount += entry.stats.TouchCount;
-        }
-    }
-    
-    if (totalCount == 0) return 1.0f;  // Default to 1.0 (no correction)
-    return (float)(totalRatio / totalCount);
-}
-
 class OverlapDirectCliOptions : public BenchmarkMeshPairCliOptions {
 public:
     OverlapDirectCliOptions() : BenchmarkMeshPairCliOptions("estimated_overlap_timing.json") {}
@@ -228,6 +215,7 @@ public:
     QueryDirection queryDirection = QueryDirection::Both;
     std::string pairsOutputPath;
     bool trackHashContention = false;
+    bool trackRawHits = false;
     bool useAlphaCorrection = true;
     unsigned long long manualHashTableSize = 0;
     float hashTableFreeMemFraction = 0.0f;
@@ -244,6 +232,7 @@ public:
         options.emplace_back("--query-direction <d>", "Query direction: both|mesh1_to_mesh2|mesh2_to_mesh1 (default: both)");
         options.emplace_back("--pairs-output <path>", "Optional CSV export path for unique result pairs");
         options.emplace_back("--track-hash-contention", "Track hash accesses and contention rate");
+        options.emplace_back("--track-raw-hits", "Record raw hits per direction on the final measured run");
         options.emplace_back("--no-alpha-correction", "Disable replication-factor alpha correction for estimated pairs");
         options.emplace_back("--hash-table-size <ull>", "Override hash table size (slots); 0 = auto-compute");
         options.emplace_back("--hash-table-free-mem-fraction <f>", "Use f in (0,1] of free GPU memory for hash table sizing");
@@ -284,6 +273,10 @@ protected:
         }
         if (arg == "--track-hash-contention") {
             trackHashContention = true;
+            return true;
+        }
+        if (arg == "--track-raw-hits") {
+            trackRawHits = true;
             return true;
         }
         if (arg == "--no-alpha-correction") {
@@ -373,101 +366,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto estimatePairs = [&](bool verbose) -> long long {
-        long long estimatedPairs = 0;
-
-        if (mesh1.grid.hasGrid && mesh2.grid.hasGrid) {
-            if (std::abs(mesh1.grid.cellSize - mesh2.grid.cellSize) > 1e-5f) {
-                if (verbose) {
-                    std::cerr << "Warning: Grid cell sizes mismatch (Mesh1: " << mesh1.grid.cellSize 
-                              << ", Mesh2: " << mesh2.grid.cellSize << "). Estimation may be invalid." << std::endl;
-                }
-            }
-
-            float cellVolume = mesh1.grid.cellSize * mesh1.grid.cellSize * mesh1.grid.cellSize;
-
-            struct Int3Hash {
-                size_t operator()(const int3& k) const {
-                    return std::hash<int>()(k.x) ^ (std::hash<int>()(k.y) << 1) ^ (std::hash<int>()(k.z) << 2);
-                }
-            };
-            struct Int3Equal {
-                bool operator()(const int3& a, const int3& b) const {
-                    return a.x == b.x && a.y == b.y && a.z == b.z;
-                }
-            };
-
-            std::unordered_map<int3, GridCell, Int3Hash, Int3Equal> mapA;
-            for (const auto& entry : mesh1.grid.sparseCells) {
-                mapA[entry.index] = entry.stats;
-            }
-
-            std::vector<GridCell> matchedA;
-            std::vector<GridCell> matchedB;
-
-            for (const auto& entry : mesh2.grid.sparseCells) {
-                auto it = mapA.find(entry.index);
-                if (it != mapA.end()) {
-                    matchedA.push_back(it->second);
-                    matchedB.push_back(entry.stats);
-                }
-            }
-
-            int numMatchedCells = matchedA.size();
-
-            float estimatedPairsFloat = 0.0f;
-            if (numMatchedCells > 0) {
-                estimatedPairsFloat = estimateOverlapSelectivity(
-                    matchedA.data(),
-                    matchedB.data(),
-                    numMatchedCells,
-                    cellVolume,
-                    epsilon,
-                    gamma
-                );
-            }
-
-            float avgSize1 = calculateGlobalAvgSize(mesh1.grid.sparseCells);
-            float avgSize2 = calculateGlobalAvgSize(mesh2.grid.sparseCells);
-            float avgVolRatio1 = calculateGlobalAvgVolRatio(mesh1.grid.sparseCells);
-            float avgVolRatio2 = calculateGlobalAvgVolRatio(mesh2.grid.sparseCells);
-
-            float effectiveSize1 = avgSize1 * std::cbrt(avgVolRatio1);
-            float effectiveSize2 = avgSize2 * std::cbrt(avgVolRatio2);
-
-            float combinedSize = effectiveSize1 + effectiveSize2;
-            float minkowskiVol = combinedSize * combinedSize * combinedSize;
-
-            if (cellVolume < 1e-9f) cellVolume = 1e-9f;
-
-            float alpha = 1.0f;
-            if (useAlphaCorrection) {
-                alpha = minkowskiVol / cellVolume;
-                if (alpha < 1.0f) alpha = 1.0f;
-            }
-
-            estimatedPairs = (long long)(estimatedPairsFloat / alpha);
-
-            if (verbose) {
-                std::cout << "\n=== Selectivity Estimation (Overlap - Direct) ===" << std::endl;
-                std::cout << "Matched Sparse Cells:      " << numMatchedCells << std::endl;
-                std::cout << "Raw Potential Pairs:       " << (long long)estimatedPairsFloat << std::endl;
-                std::cout << "Avg Object Size (Mesh1):   " << avgSize1 << std::endl;
-                std::cout << "Avg Object Size (Mesh2):   " << avgSize2 << std::endl;
-                std::cout << "Avg VolRatio (Mesh1):      " << avgVolRatio1 << std::endl;
-                std::cout << "Avg VolRatio (Mesh2):      " << avgVolRatio2 << std::endl;
-                std::cout << "Effective Size (Mesh1):    " << effectiveSize1 << std::endl;
-                std::cout << "Effective Size (Mesh2):    " << effectiveSize2 << std::endl;
-                std::cout << "Alpha Correction Enabled:  " << (useAlphaCorrection ? "yes" : "no") << std::endl;
-                std::cout << "Replication Factor (alpha):" << alpha << std::endl;
-                std::cout << "Final Estimated Pairs:     " << estimatedPairs << std::endl;
-                std::cout << "==============================\n" << std::endl;
-            }
-        } else if (verbose) {
-            std::cout << "Skipping estimation: Grid data not found." << std::endl;
-        }
-
-        return estimatedPairs;
+    auto estimatePairs = [&] {
+        return pierce::estimateOverlapPairs(mesh1.grid, mesh2.grid, epsilon, gamma, useAlphaCorrection);
     };
 
     auto computeHashTableSize = [&](long long estimatedPairs) -> unsigned long long {
@@ -488,21 +388,12 @@ int main(int argc, char* argv[]) {
             std::cerr << "Warning: cudaMemGetInfo failed for free-memory hash sizing. Falling back to estimate-based sizing." << std::endl;
         }
 
-        unsigned long long hash_table_size = 16777216;
-        if (estimatedPairs > 0) {
-            unsigned long long target = (unsigned long long)(estimatedPairs / 0.5);
-            if (target < 1024) target = 1024;
-            if (target > 2147483648ULL) target = 2147483648ULL;
-
-            hash_table_size = target;
-            if (hash_table_size % 2 == 0) hash_table_size++;
-        }
-        return hash_table_size;
+        return pierce::estimatedOverlapHashSlots(estimatedPairs);
     };
 
     if (estimateOnly) {
         timer.next("Selectivity Estimation");
-        const long long estimatedPairs = estimatePairs(false);
+        const long long estimatedPairs = estimatePairs();
         const unsigned long long hash_table_size = (manualHashTableSize > 0)
             ? manualHashTableSize
             : computeHashTableSize(estimatedPairs);
@@ -586,7 +477,7 @@ int main(int argc, char* argv[]) {
     if (warmupRuns > 0) {
         std::cout << "Running " << warmupRuns << " warmup iterations (estimation + hash query)..." << std::endl;
         for (int warmup = 0; warmup < warmupRuns; ++warmup) {
-            long long warmupEstimatedPairs = estimatePairs(false);
+            long long warmupEstimatedPairs = estimatePairs();
             unsigned long long warmupHashSize = computeHashTableSize(warmupEstimatedPairs);
             unsigned long long* d_warmup_hash_table = nullptr;
             CUDA_CHECK(cudaMalloc(&d_warmup_hash_table, warmupHashSize * sizeof(unsigned long long)));
@@ -621,7 +512,7 @@ int main(int argc, char* argv[]) {
         bool verboseRun = (run == 0);
 
         timer.next("Selectivity Estimation");
-        long long estimatedPairs = estimatePairs(false);
+        long long estimatedPairs = estimatePairs();
         unsigned long long hash_table_size = (manualHashTableSize > 0)
             ? manualHashTableSize
             : computeHashTableSize(estimatedPairs);
@@ -657,7 +548,8 @@ int main(int argc, char* argv[]) {
             queryDirection,
             &timer,
             verboseRun,
-            trackHashContention
+            trackHashContention,
+            options.trackRawHits && run == numberOfRuns - 1
         );
 
         timer.next("Download Results");

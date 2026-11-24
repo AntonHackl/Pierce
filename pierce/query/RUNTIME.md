@@ -1,10 +1,10 @@
-# Persistent exact-overlap runtime
+# Persistent selectivity-estimated overlap runtime
 
-`pierce_query_runtime` supplies the two-pass overlap implementation shared by
-`pierce_overlap_two_pass` and the persistent worker. The benchmark CLI retains its
-arguments, setup order, warmups, CSV export, and historical timing definitions.
-The runtime's preflight memory policy is opt-in at the query/build helper level;
-the CLI does not enable it. Other query applications retain their default behavior.
+The persistent worker uses the same grid-based estimator as the
+`pierce_overlap` CLI. Each query sizes a hash table from the estimate and
+traces edges in both directions, inserting unique object pairs during tracing.
+The worker grows the table and repeats the hash query if an insertion fails.
+The two-pass implementation remains available through `pierce_overlap_two_pass`.
 
 ## Ownership and API
 
@@ -17,7 +17,7 @@ idempotent; changing paths under a resident key is rejected. Query and unload us
 
 Each pair retains its load measurement, completed-query count, last successful
 query metrics, and explicitly owned resident bytes. `RuntimeResult` returns the
-full unique object-pair vector plus timings and raw result-buffer measurements.
+full unique object-pair vector plus timings and estimate, raw-hit count, and temporary buffer sizes.
 Worker responses transmit only metrics. Every query constructs fresh parameters
 and temporary buffers; the resident meshes, edges, BVHs, and pipeline are reused.
 Failed query budgeting leaves previous successful metrics intact.
@@ -26,13 +26,13 @@ Calls must be serialized on one owning thread. Pairs remain at stable addresses
 and are destroyed before their pipeline/context. No implicit warmup or eviction
 occurs. Pipeline initialization happens on the worker's first Load.
 
-## Worker protocol, version 2
+## Worker protocol, version 3
 
 Run `pierce_worker [--ptx path/to/mesh_overlap_edges.ptx]`. Send one UTF-8 JSON
 object per line on stdin; read one response per request from stdout. Existing
 native diagnostics are redirected to stderr, which clients must continuously drain.
 
-Requests contain `version: 2`, a nonempty string `id`, and `command`:
+Requests contain `version: 3`, a nonempty string `id`, and `command`:
 
 | Command | Additional request fields | Behavior |
 | --- | --- | --- |
@@ -42,14 +42,18 @@ Requests contain `version: 2`, a nonempty string `id`, and `command`:
 | `status` | none | Observe registry, counters, memory, and allocation checkpoints |
 | `shutdown` | none | Release all resources and exit after replying |
 
-Success replies contain `{ "version": 2, "id": "...", "ok": true, "data": ... }`.
+Success replies contain `{ "version": 3, "id": "...", "ok": true, "data": ... }`.
 Every success includes a complete status snapshot: `pairs`, lifetime lifecycle
 counters, `runtimeInitializationUs`, explicitly owned dataset/runtime bytes,
 `memory`, and `checkpoints`. Before initialization `memory` is null. After shutdown
 pairs are empty and memory is null. Each pair has `key`, `pairHandle`,
 `datasetLoadUs`, `datasetGpuBytes`, `completedQueries`, and nullable `lastResult`.
 The latter contains `resultCount`, `queryExecutionUs`, `benchmarkPhaseSumUs`,
-`rawHitCount`, and `resultBufferBytes`.
+`estimatedPairCount`, `rawHitCount`, `hashTableBytes`, `resultBufferBytes`,
+and `phaseTimingsUs`. The phase timings report `estimation`, `trace`
+(including hash insertion and any retried launches), `compaction`, and
+`download` (including host result preparation and aggregation of hit counters).
+`benchmarkPhaseSumUs` adds these four timings.
 
 Recoverable errors have `ok: false`, `code`, an `error` message, and the surviving
 status in `data`. Memory errors use `code: "memory_budget_exceeded"` with `details`
@@ -63,9 +67,8 @@ invalidate every handle. EOF also releases resources and exits.
 `MemoryBudget` reserves `max(512 MiB, 10% of total CUDA memory)` and supports an
 injected `MemoryProvider` for deterministic rejection tests. Upload guards cover
 mesh/edge allocations; BVH guards use OptiX's exact reported output and temporary
-build sizes. Queries check count/offset buffers before allocation, then check the
-raw result bytes plus twice that size as estimated sorting workspace after hit
-counting. Byte additions/multiplications are checked for overflow.
+build sizes. Queries check the estimator buffers, hash table and counters, and
+compacted output buffer before allocation. Byte additions/multiplications are checked for overflow.
 
 Allocation checkpoints record stage, requested bytes, and observed device memory.
 Status reports device name, total/free/reserved bytes. Explicit accounting excludes
@@ -77,11 +80,11 @@ CUDA allocation errors retain the existing fatal-process behavior.
 ## Verification
 
 `pierce_runtime_verify a.pre b.pre baseline.csv zero.pre` checks the fixed small
-cube workload, 100 full-pair comparisons, reloads, failure paths, and zero results.
+cube workload, 100 full-pair comparisons, reloads, failure paths, underestimated queries that require hash growth, and zero results.
 
 `pierce_multi_verify small-a small-b large-a large-b small.csv large.csv` checks
 100 alternating full-pair comparisons, independent pair lifetimes, exactly four
-initial reads/uploads/builds, injected upload/BVH/edge/count/result-budget
+initial reads/uploads/builds, injected load and query memory-budget
 rejections, cleanup/recovery, stale handles, checked arithmetic, and reload cycles.
 Global CUDA free-memory checks allow 16 MiB of variation; explicitly owned bytes
 must return exactly to prior values. Run the verifiers on an otherwise idle GPU.

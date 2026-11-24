@@ -143,6 +143,7 @@ set(OPTIX_PROGRAM_TARGET "--ptx")
 
 NVCUDA_COMPILE_MODULE(
     SOURCES       ${CUDA_SOURCES} ${MESH_CONTAINMENT_SOURCE}
+    DEPENDENCIES  ${RAYTRACING_DIR}/MeshOverlapEdgesLaunchParams.h
     TARGET_PATH   ${PTX_OUTPUT_DIR}
     EXTENSION     "${OPTIX_MODULE_EXTENSION}"
     GENERATED_FILES PTX_FILES
@@ -153,13 +154,14 @@ NVCUDA_COMPILE_MODULE(
 # Executables
 # -----------------------------------------------------------------------
 
-# Shared exact-overlap engine, also used by the original benchmark CLI.
+# Persistent overlap runtime and the legacy two-pass benchmark.
 add_library(pierce_query_runtime STATIC
     ${SRC_DIR}/runtime/OverlapQuery.cpp
     ${SRC_DIR}/runtime/QueryRuntime.cpp
+    ${SRC_DIR}/runtime/OverlapEstimation.cpp
     ${RUNTIME_SOURCES} ${TIMER_SOURCE} ${OPTIX_SOURCES} ${GEOMETRY_SOURCES}
     ${RAYTRACING_DIR}/MeshOverlapEdgesLauncher.cpp
-    ${MESH_QUERY_DEDUP_SOURCE} ${SCAN_UTILS_SOURCE})
+    ${MESH_QUERY_DEDUP_SOURCE} ${SCAN_UTILS_SOURCE} ${ESTIMATED_OVERLAP_SOURCE})
 add_executable(pierce_overlap_two_pass ${MESH_OVERLAP_APP_SOURCE})
 add_executable(pierce_worker ${SRC_DIR}/applications/pierce_worker_main.cpp)
 add_executable(pierce_multi_verify ${SRC_DIR}/applications/pierce_multi_verify.cpp)
@@ -190,6 +192,7 @@ add_executable(pierce_intersection
 
 add_executable(pierce_overlap
     ${ESTIMATED_OVERLAP_APP_SOURCE}
+    ${SRC_DIR}/runtime/OverlapEstimation.cpp
     ${RUNTIME_SOURCES}
     ${TIMER_SOURCE}
     ${OPTIX_SOURCES}
@@ -292,3 +295,18 @@ add_custom_target(copy_ptx ALL
 foreach(TARGET_NAME pierce_multi_verify pierce_runtime_verify pierce_query_runtime pierce_worker pierce_overlap_two_pass pierce_overlap pierce_intersection pierce_containment)
     add_dependencies(${TARGET_NAME} copy_ptx)
 endforeach()
+
+set(CANDIDATE_PTX_DIR "${RUNTIME_PTX_DIR}/candidate")
+file(MAKE_DIRECTORY "${CANDIDATE_PTX_DIR}")
+NVCUDA_COMPILE_MODULE(
+    SOURCES ${CUDA_DIR}/candidate/mesh_overlap_edges.cu
+    DEPENDENCIES ${RAYTRACING_DIR}/MeshOverlapEdgesLaunchParams.h
+                 ${RAYTRACING_DIR}/CandidatePairInputs.h ${CUDA_DIR}/optix_common_shaders.cuh
+    TARGET_PATH ${CANDIDATE_PTX_DIR} EXTENSION ".ptx" GENERATED_FILES CANDIDATE_PTX
+    NVCC_OPTIONS "--ptx" "--gpu-architecture=sm_75" "--relocatable-device-code=true"
+                 "-I${OptiX_INCLUDE}" "-I${CMAKE_CURRENT_SOURCE_DIR}/../common/include")
+add_custom_target(candidate_pair_ptx DEPENDS ${CANDIDATE_PTX})
+add_executable(pierce_bvh_compare ${SRC_DIR}/applications/pierce_bvh_compare.cpp)
+set_target_properties(pierce_bvh_compare PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${RUNTIME_PTX_DIR})
+target_link_libraries(pierce_bvh_compare PRIVATE pierce_query_runtime)
+add_dependencies(pierce_bvh_compare candidate_pair_ptx copy_ptx)

@@ -82,16 +82,23 @@ int main(int argc, char** argv) {
         catch (const std::exception&) { rejected = true; }
         require(rejected && runtime.pairs().empty() && runtime.datasetBytes() == 0, "Pair load was not atomic");
         auto zero = RaySpace::IO::readBinaryFile(argv[2]);
+        zero.grid.hasGrid = false;
+        require(RaySpace::IO::writeBinaryFile(argv[4], zero), "Could not write underestimation fixture");
+        const auto underestimated = runtime.loadPair("underestimate", argv[1], argv[4]).handle;
+        auto recovered = runtime.queryPair(underestimated);
+        require(recovered.estimatedPairCount == 0 && recovered.hashTableBytes > 1025 * sizeof(unsigned long long)
+                && recovered.rawHitCount == 70000 && pairs(recovered) == expected,
+                "Underestimated query did not grow the hash table and recover the full result");
+        runtime.unloadPair(underestimated);
         for (auto& vertex : zero.vertices) vertex.x += 10000;
         for (auto& edge : zero.edges.edgeStarts) edge.x += 10000;
         for (auto& edge : zero.edges.edgeEnds) edge.x += 10000;
-        zero.grid.hasGrid = false;
         require(RaySpace::IO::writeBinaryFile(argv[4], zero), "Could not write zero fixture");
         runtime.loadPair("small", argv[1], argv[4]);
         require(runtime.queryPair(runtime.pairs().begin()->second->handle).pairs.empty(), "Zero fixture returned pairs");
         runtime.unloadPair(runtime.pairs().begin()->first);
         std::cout << "PASS: 100 resident queries, full baseline/analytical pair equality, stable handles and indexes, "
-                     "5 reload cycles, stale handles, atomic failure, zero results.\n"
+                     "5 reload cycles, stale handles, atomic failure, underestimated and zero results.\n"
                   << "Resident dataset GPU bytes: " << residentBytes << "; free bytes after queries 2/100: "
                   << afterSecond << "/" << afterHundred << "\n";
         return 0;

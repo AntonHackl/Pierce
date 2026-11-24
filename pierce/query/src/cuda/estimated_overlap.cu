@@ -1,4 +1,5 @@
 #include "estimated_overlap.h"
+#include "../optix/OptixHelpers.h"
 #include <device_launch_parameters.h>
 #include <thrust/device_vector.h>
 #include <thrust/reduce.h>
@@ -52,26 +53,25 @@ float estimateOverlapSelectivity(
     GridCell* d_gridB = nullptr;
     float* d_result = nullptr;
     
-    cudaError_t err = cudaMalloc(&d_gridA, numCells * sizeof(GridCell));
-    if (err != cudaSuccess) return -1.0f;
-    cudaMalloc(&d_gridB, numCells * sizeof(GridCell));
-    cudaMalloc(&d_result, numCells * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&d_gridA, numCells * sizeof(GridCell)));
+    CUDA_CHECK(cudaMalloc(&d_gridB, numCells * sizeof(GridCell)));
+    CUDA_CHECK(cudaMalloc(&d_result, numCells * sizeof(float)));
     
-    cudaMemcpy(d_gridA, h_gridA, numCells * sizeof(GridCell), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_gridB, h_gridB, numCells * sizeof(GridCell), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_gridA, h_gridA, numCells * sizeof(GridCell), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_gridB, h_gridB, numCells * sizeof(GridCell), cudaMemcpyHostToDevice));
     
     int blockSize = 256;
     int numBlocks = (numCells + blockSize - 1) / blockSize;
     
     estimateSelectivityKernel<<<numBlocks, blockSize>>>(d_gridA, d_gridB, d_result, numCells, cellVolume, epsilon, gamma);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     thrust::device_ptr<float> ptr(d_result);
     float total = thrust::reduce(ptr, ptr + numCells, 0.0f, thrust::plus<float>());
     
-    cudaFree(d_gridA);
-    cudaFree(d_gridB);
-    cudaFree(d_result);
+    CUDA_CHECK(cudaFree(d_gridA));
+    CUDA_CHECK(cudaFree(d_gridB));
+    CUDA_CHECK(cudaFree(d_result));
     
     return total;
 }

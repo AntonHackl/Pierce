@@ -62,5 +62,14 @@ foreach ($component in $Only) {
     if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed for $component." }
     & $cmake --build $build --parallel $Jobs
     if ($LASTEXITCODE -ne 0) { throw "Build failed for $component." }
+    # Stage runtime imports beside the executables for launches outside Conda.
+    $runtimeDlls = @('cudart64_12.dll')
+    if ($component -eq 'preprocess') {
+        $runtimeDlls += 'libgmp-10.dll'
+    }
+    $runtimeDir = Join-Path $build 'bin'
+    foreach ($dll in $runtimeDlls) {
+        Copy-Item -LiteralPath (Join-Path $prefix "Library/bin/$dll") -Destination $runtimeDir -Force
+    }
 }
 Write-Host 'Pierce Windows build completed.'

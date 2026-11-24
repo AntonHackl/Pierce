@@ -36,7 +36,13 @@ static std::string pairJson(const pierce::ResidentPair& p) {
     if (!p.completedQueries) out << "null";
     else out << "{\"resultCount\":" << p.resultCount << ",\"queryExecutionUs\":" << p.queryExecutionUs
              << ",\"benchmarkPhaseSumUs\":" << p.benchmarkPhaseSumUs << ",\"rawHitCount\":" << p.rawHitCount
-             << ",\"resultBufferBytes\":" << p.resultBufferBytes << "}";
+             << ",\"resultBufferBytes\":" << p.resultBufferBytes
+             << ",\"estimatedPairCount\":" << p.estimatedPairCount
+             << ",\"hashTableBytes\":" << p.hashTableBytes
+             << ",\"phaseTimingsUs\":{\"estimation\":" << p.phaseTimings.estimationUs
+             << ",\"trace\":" << p.phaseTimings.traceUs
+             << ",\"compaction\":" << p.phaseTimings.compactionUs
+             << ",\"download\":" << p.phaseTimings.downloadUs << "}}";
     out << "}";
     return out.str();
 }
@@ -85,8 +91,8 @@ int main(int argc, char** argv) {
             std::istringstream input(line);
             boost::property_tree::read_json(input, request);
             id = request.get<std::string>("id");
-            if (id.empty() || request.get<int>("version") != 2)
-                throw std::runtime_error("Expected nonempty id and protocol version 2");
+            if (id.empty() || request.get<int>("version") != 3)
+                throw std::runtime_error("Expected nonempty id and protocol version 3");
             const auto command = request.get<std::string>("command");
             if (command == "load") {
                 auto key = request.get<std::string>("key");
@@ -110,18 +116,18 @@ int main(int argc, char** argv) {
                 runtime.reset();
                 shutdown = true;
             } else if (command != "status") throw std::runtime_error("Unknown command");
-            protocol << "{\"version\":2,\"id\":" << quote(id) << ",\"ok\":true,\"data\":"
+            protocol << "{\"version\":3,\"id\":" << quote(id) << ",\"ok\":true,\"data\":"
                      << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
         } catch (const pierce::MemoryBudgetExceeded& error) {
             const auto& point = error.checkpoint;
-            protocol << "{\"version\":2,\"id\":" << quote(id)
+            protocol << "{\"version\":3,\"id\":" << quote(id)
                 << ",\"ok\":false,\"error\":" << quote(error.what())
                 << ",\"code\":\"memory_budget_exceeded\",\"details\":{\"stage\":" << quote(point.stage)
                 << ",\"requiredBytes\":" << point.required << ",\"availableBytes\":" << point.memory.available()
                 << ",\"reservedBytes\":" << point.memory.reserve() << "},\"data\":"
                 << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
         } catch (const std::exception& error) {
-            protocol << "{\"version\":2,\"id\":" << quote(id) << ",\"ok\":false,\"code\":\"native_error\",\"error\":"
+            protocol << "{\"version\":3,\"id\":" << quote(id) << ",\"ok\":false,\"code\":\"native_error\",\"error\":"
                      << quote(error.what()) << ",\"data\":" << statusJson(runtime.get(), initializationUs) << "}\n" << std::flush;
         }
         if (shutdown) break;

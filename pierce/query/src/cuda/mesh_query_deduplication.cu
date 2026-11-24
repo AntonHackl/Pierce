@@ -125,8 +125,8 @@ int compact_hash_table_pairs(
     MeshQueryResult* d_output, int max_output_size
 ) {
     int* d_count;
-    cudaMalloc(&d_count, sizeof(int));
-    cudaMemset(d_count, 0, sizeof(int));
+    CUDA_CHECK(cudaMalloc(&d_count, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_count, 0, sizeof(int)));
     
     int threads = 256;
     int blocks = (table_size + threads - 1) / threads;
@@ -134,11 +134,11 @@ int compact_hash_table_pairs(
     compact_hash_pairs_kernel<<<blocks, threads>>>(
         d_hash_table, table_size, d_output, d_count, max_output_size
     );
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     int h_count = 0;
-    cudaMemcpy(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaFree(d_count);
+    CUDA_CHECK(cudaMemcpy(&h_count, d_count, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_count));
     
     return (h_count < max_output_size) ? h_count : max_output_size;
 }

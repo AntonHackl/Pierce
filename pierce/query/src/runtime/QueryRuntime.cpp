@@ -1,6 +1,9 @@
 #include "QueryRuntime.h"
 #include "GeometryIO.h"
+#include "OverlapEstimation.h"
+#include "../cuda/mesh_query_deduplication.h"
 #include <chrono>
+#include <numeric>
 #include <stdexcept>
 
 namespace {
@@ -8,6 +11,9 @@ using Clock = std::chrono::steady_clock;
 long long elapsed(Clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
 }
+struct DeviceRelease {
+    template<class T> void operator()(T* pointer) const { if (pointer) CUDA_CHECK(cudaFree(pointer)); }
+};
 MeshOverlapEdgesLaunchParams parameters(pierce::ResidentDataset& source,
                                        pierce::ResidentDataset& target, int swap) {
     MeshOverlapEdgesLaunchParams p{};
@@ -98,32 +104,79 @@ RuntimeResult QueryRuntime::queryPair(const std::string& handle) {
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto start = Clock::now();
     auto p1 = parameters(*resident.a, *resident.b, 0), p2 = parameters(*resident.b, *resident.a, 1);
-    PerformanceTimer measurements;
-    auto raw = executeTwoPassQueryEdgesOptimized(launcher_, p1, p2,
-        resident.a->edges.num_edges, resident.b->edges.num_edges, &measurements, false, &budget_);
-    auto release = [](MeshQueryResult* p) { if (p) CUDA_CHECK(cudaFree(p)); };
-    std::unique_ptr<MeshQueryResult, decltype(release)> buffer(raw.d_merged_results, release);
-    const auto downloadStart = Clock::now();
     RuntimeResult result;
-    result.pairs.resize(static_cast<size_t>(raw.numUnique));
-    if (raw.numUnique) CUDA_CHECK(cudaMemcpy(result.pairs.data(), buffer.get(),
-        result.pairs.size() * sizeof(MeshQueryResult), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaDeviceSynchronize());
-    result.benchmarkPhaseSumUs = elapsed(downloadStart);
-    for (const char* name : {"Raytrace_Mesh1ToMesh2_Pass1", "Raytrace_Mesh2ToMesh1_Pass1",
-                            "Raytrace_Mesh1ToMesh2_Pass2", "Raytrace_Mesh2ToMesh1_Pass2", "gpu deduplication"})
-        result.benchmarkPhaseSumUs += measurements.getMeasurementDuration(name);
-    buffer.reset();
+    const auto estimateStart = Clock::now();
+    const auto estimated = estimateOverlapPairs(resident.a->geometry.grid, resident.b->geometry.grid,
+                                               0.001f, 0.8f, true, &budget_);
+    result.estimatedPairCount = estimated;
+    result.phaseTimings.estimationUs = elapsed(estimateStart);
+
+    constexpr Bytes maxSlots = std::numeric_limits<int>::max();
+    constexpr Bytes statsBytes = (overlapRawHitShards + 1) * sizeof(unsigned int);
+    auto slots = estimated > 0 ? std::min<Bytes>(estimatedOverlapHashSlots(estimated), maxSlots) : 1025;
+    p1.use_hash_table = p2.use_hash_table = 1;
+    for (;;) {
+        result.hashTableBytes = checkedMultiply(slots, sizeof(unsigned long long));
+        budget_.check(checkedAdd(result.hashTableBytes, statsBytes), "query_hash_table");
+        unsigned long long* table = nullptr;
+        CUDA_CHECK(cudaMalloc(&table, result.hashTableBytes));
+        std::unique_ptr<unsigned long long, DeviceRelease> ownTable(table);
+        CUDA_CHECK(cudaMemset(table, 0xff, result.hashTableBytes));
+        unsigned int* stats = nullptr;
+        CUDA_CHECK(cudaMalloc(&stats, statsBytes));
+        std::unique_ptr<unsigned int, DeviceRelease> ownStats(stats);
+        CUDA_CHECK(cudaMemset(stats, 0, statsBytes));
+        p1.hash_table = p2.hash_table = table;
+        p1.hash_table_size = p2.hash_table_size = slots;
+        p1.hash_insert_failed = p2.hash_insert_failed = stats;
+        p1.raw_hit_counters = p2.raw_hit_counters = stats + 1;
+
+        const auto traceStart = Clock::now();
+        launcher_.launchMesh1ToMesh2(p1, p1.num_edges);
+        launcher_.launchMesh2ToMesh1(p2, p2.num_edges);
+        unsigned int failed = 0;
+        CUDA_CHECK(cudaMemcpy(&failed, stats, sizeof(failed), cudaMemcpyDeviceToHost));
+        result.phaseTimings.traceUs += elapsed(traceStart);
+        if (failed) {
+            if (slots == maxSlots) throw std::runtime_error("Overlap hash table exhausted its supported capacity");
+            slots = std::min(maxSlots, 2 * slots + 1);
+            continue;
+        }
+
+        // One output slot per hash slot guarantees space for every inserted pair.
+        result.resultBufferBytes = checkedMultiply(slots, sizeof(MeshQueryResult));
+        budget_.check(checkedAdd(result.resultBufferBytes, sizeof(int)), "query_compaction");
+        MeshQueryResult* output = nullptr;
+        CUDA_CHECK(cudaMalloc(&output, result.resultBufferBytes));
+        std::unique_ptr<MeshQueryResult, DeviceRelease> ownOutput(output);
+        const auto compactStart = Clock::now();
+        const int count = compact_hash_table_pairs(table, slots, output, static_cast<int>(slots));
+        result.phaseTimings.compactionUs = elapsed(compactStart);
+
+        const auto downloadStart = Clock::now();
+        result.pairs.resize(count);
+        if (count) CUDA_CHECK(cudaMemcpy(result.pairs.data(), output,
+            result.pairs.size() * sizeof(MeshQueryResult), cudaMemcpyDeviceToHost));
+        std::vector<unsigned int> rawHits(overlapRawHitShards);
+        CUDA_CHECK(cudaMemcpy(rawHits.data(), stats + 1, statsBytes - sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        result.rawHitCount = std::accumulate(rawHits.begin(), rawHits.end(), Bytes{0});
+        result.phaseTimings.downloadUs = elapsed(downloadStart);
+        break;
+    }
+
+    result.benchmarkPhaseSumUs = result.phaseTimings.estimationUs + result.phaseTimings.traceUs
+                               + result.phaseTimings.compactionUs + result.phaseTimings.downloadUs;
     CUDA_CHECK(cudaDeviceSynchronize());
     result.queryExecutionUs = elapsed(start);
-    result.rawHitCount = raw.resultBufferCapacity;
-    result.resultBufferBytes = raw.resultBufferAllocatedBytes;
     ++queries_; ++resident.completedQueries;
     resident.resultCount = result.pairs.size();
     resident.queryExecutionUs = result.queryExecutionUs;
     resident.benchmarkPhaseSumUs = result.benchmarkPhaseSumUs;
+    resident.phaseTimings = result.phaseTimings;
     resident.rawHitCount = result.rawHitCount;
     resident.resultBufferBytes = result.resultBufferBytes;
+    resident.estimatedPairCount = result.estimatedPairCount;
+    resident.hashTableBytes = result.hashTableBytes;
     return result;
 }
 }

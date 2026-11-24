@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
             denyStage.clear();
             require(canonical(runtime.queryPair(small).pairs) == smallExpected, "Query after failed load changed");
         }
-        for (const char* stage : {"query_counts", "query_results_and_sort"}) {
+        for (const char* stage : {"query_estimation", "query_hash_table", "query_compaction"}) {
             denyStage = stage; denyAfter = 1;
             auto freeBefore = runtime.memory().free;
             bool denied = false;
@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
         require(runtime.datasetBytes() == 0, "Unload left resident buffers");
         std::cout << "Memory after unload/free: " << runtime.memory().free << '\n';
         std::cout << "PASS: 100 alternating full-pair comparisons, isolated reload, stable residency, budget arithmetic, "
-                     "upload/BVH/edge/count/result rejections, recovery, stale handles. Large pairs: " << largeExpected.size() << '\n';
+                     "load and query budget rejections, recovery, stale handles. Large pairs: " << largeExpected.size() << '\n';
         return 0;
     } catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 }

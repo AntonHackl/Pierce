@@ -2,7 +2,8 @@
 #include "../optix/OptixContext.h"
 #include "../optix/OptixAccelerationStructure.h"
 #include "../geometry/PrecomputedEdgeData.h"
-#include "OverlapQuery.h"
+#include "../raytracing/MeshOverlapEdgesLauncher.h"
+#include "MemoryBudget.h"
 #include <memory>
 #include <chrono>
 #include <map>
@@ -19,17 +20,24 @@ struct ResidentDataset {
     ~ResidentDataset();
     size_t allocatedBytes() const;
 };
+struct QueryPhaseTimings {
+    long long estimationUs = 0, traceUs = 0, compactionUs = 0, downloadUs = 0;
+};
 struct RuntimeResult {
     std::vector<MeshQueryResult> pairs;
     long long queryExecutionUs = 0, benchmarkPhaseSumUs = 0;
+    QueryPhaseTimings phaseTimings;
     Bytes rawHitCount = 0, resultBufferBytes = 0;
+    Bytes estimatedPairCount = 0, hashTableBytes = 0;
 };
 struct ResidentPair {
     std::string key, handle, pathA, pathB;
     std::unique_ptr<ResidentDataset> a, b;
     long long loadUs = 0;
     Bytes completedQueries = 0, resultCount = 0, rawHitCount = 0, resultBufferBytes = 0;
+    Bytes estimatedPairCount = 0, hashTableBytes = 0;
     long long queryExecutionUs = 0, benchmarkPhaseSumUs = 0;
+    QueryPhaseTimings phaseTimings;
     size_t allocatedBytes() const { return checkedAdd(a->allocatedBytes(), b->allocatedBytes()); }
 };
 // All operations run on one owning thread. Declaration order destroys resident
